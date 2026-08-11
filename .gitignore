@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+debug_*.png
+*.bak
+*.Q
+*.zip
+.DS_Store
+Thumbs.db
+
+# 测试输出和调试文件
+_test_output/
+_debug_room_list/
+debug.log
+
+# PortableGit 安装包
+_PortableGit*
