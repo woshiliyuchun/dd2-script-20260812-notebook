@@ -115,6 +115,8 @@ CONFIG = {
     "bekick2_template": str(SCRIPT_DIR / "picture" / "bekick2.png"),
     "bekick3_template": str(SCRIPT_DIR / "picture" / "bekick3.png"),
     "roomfull_template": str(SCRIPT_DIR / "picture" / "roomfull.png"),
+    "roomfull_9001_template": r"D:\DD2脚本\dd2onslaught\picture\9001roomfull.png",
+    "roomfull_9001_v2_template": r"D:\DD2脚本\dd2onslaught\picture\9001roomfullv2.png",
     "kickok_template": str(SCRIPT_DIR / "picture" / "kickok.png"),
     "private_tavern_template": str(SCRIPT_DIR / "picture" / "PRIVATETAVERN.png"),
     "ready_template": str(SCRIPT_DIR / "picture" / "ready.png"),
@@ -138,7 +140,7 @@ CONFIG = {
     "chaos91011_room_template": str(SCRIPT_DIR / "picture" / "chaos91011room.png"),
     "resetconfirm_template": str(SCRIPT_DIR / "picture" / "resetconfirm.png"),
     "setfaild_template": str(SCRIPT_DIR / "picture" / "setfaild.png"),
-    "connectionfailed_template": str(SCRIPT_DIR / "picture" / "connectionfailed.png"),
+    "connectionfailed_template": r"D:\DD2脚本\DD2ganmedie\connectionfailed.png",
 
     # 识别阈值与扫描参数
     # 这里把阈值放低一点，避免你补的模板图与实际游戏中的字体/角度略有差异时直接失配。
@@ -175,6 +177,8 @@ LAST_ROUND_HAD_GEAR_CHECK = False     # 上一轮是否做过换装判断（用�
 NEED_RESET_AFTER_ROUND = False        # 保留变量名，不再使用
 LAST_COMPLETED_FLOOR = None           # 上一次完整打完的Selected Floor数字，用于判断是否>320
 NEED_VIEW_RESET_BEFORE_NEXT_WAR = False  # True 时：下一次 walk_to_war_table 识别到War Table之后、按E之前，执行视角专项→再卡死重启
+LAST_PLAYER_READY_TIME = None         # 最近一次检测到队友准备（绿色对钩）的时间戳，用于30分钟无准备卡死重启（全流程适用）
+ROOMFULL_9001_TRIGGERED = False       # 双击房间后1分钟内检测到9001roomfull时标记为True，跳过run_room_progression_loop直接重新识别e-tip
 
 # ========================= 卡死检测配置（来自 dd2gamedie.py） =========================
 # 模板路径：卡死恢复流程中需要用到的图像（关闭游戏、Steam 重启等）
@@ -341,7 +345,7 @@ def check_connection_failed():
     hwnd = find_game_window()
     frame = capture_game_window(hwnd)
     template = load_template(CONFIG["connectionfailed_template"])
-    rect = find_template_rect(frame, template, threshold=0.6)
+    rect = find_template_rect(frame, template, threshold=0.9)
     if rect:
         print("[INFO] 检测到网络连接断开（connectionfailed），触发卡死恢复流程")
         if FREEZE_MONITOR:
@@ -716,12 +720,24 @@ def recover_game():
     if not tavern_pos:
         print("[警告] 未找到'私人城镇'按钮，但游戏已成功重启")
 
-    # 第9步：等待1分钟让游戏完全加载
-    print("[恢复] 等待1分钟让游戏完全加载...")
-    for i in range(60, 0, -1):
-        if i % 10 == 0:
-            print(f"[恢复] 剩余 {i} 秒...")
-        time.sleep(1)
+    # 第9步：每 5 秒识别一次 War Table，识别到即代表游戏已加载进入私人城堡界面
+    print("[恢复] 开始每 5 秒识别 War Table，识别到即继续…")
+    war_table_timeout = 180  # 最长等 3 分钟兜底（避免异常情况下永久等待）
+    war_table_found = False
+    for _ in range(war_table_timeout // 5):
+        if STOP_FLAG:
+            print("[恢复] 收到停止信号，退出等待")
+            return False
+        hwnd = find_game_window()
+        if hwnd:
+            wt_match = detect_war_table(hwnd)
+            if wt_match is not None:
+                print(f"[恢复] 已识别到 War Table（置信度={wt_match[2]:.4f}），游戏加载完成，继续")
+                war_table_found = True
+                break
+        time.sleep(5)
+    if not war_table_found:
+        print(f"[恢复] 等待 {war_table_timeout} 秒后仍未识别到 War Table，继续流程（兜底）")
 
     # 重置 REFRESH 缓存坐标（游戏重启后坐标可能变化）
     REFRESH_CLICK_POINT = None
@@ -1810,7 +1826,8 @@ def detect_finish_game_and_click_to_tavern():
 
 def detect_other_players_ready():
     """检测左侧玩家头像右下角是否有绿色对勾（其他玩家已准备）。
-    返回 True 表示检测到有玩家准备了。"""
+    返回 True 表示检测到有玩家准备了。同时更新 LAST_PLAYER_READY_TIME。"""
+    global LAST_PLAYER_READY_TIME
     if not os.path.exists(CONFIG["ready_template"]):
         print("[WARN] ready 模板不存在，跳过检测")
         return False
@@ -1830,6 +1847,7 @@ def detect_other_players_ready():
 
     if max_val >= 0.6:
         print(f"[INFO] 检测到其他玩家已准备（置信度: {max_val:.2f}）")
+        LAST_PLAYER_READY_TIME = time.time()
         return True
     return False
 
@@ -1993,6 +2011,47 @@ def detect_room_full():
     return True
 
 
+def detect_roomfull_9001_and_handle():
+    """检测 9001roomfull.png 或 9001roomfullv2.png（点击房间后瞬间弹出的房间满员提示）。
+    检测到其中任意一个后按 Enter 确认，返回 True；未检测到返回 False。
+    该函数在双击进入房间后 60 秒内每 10 秒调用一次。"""
+    global ROOMFULL_9001_TRIGGERED
+
+    # 同时支持两个模板：9001roomfull.png 和 9001roomfullv2.png
+    template_paths = [
+        CONFIG.get("roomfull_9001_template"),
+        CONFIG.get("roomfull_9001_v2_template"),
+    ]
+    template_paths = [p for p in template_paths if p and os.path.exists(p)]
+    if not template_paths:
+        return False
+
+    hwnd = find_game_window()
+    if not hwnd:
+        return False
+
+    frame = capture_game_window(hwnd)
+    matched_template = None
+    matched_rect = None
+    for tp in template_paths:
+        template = load_template(tp)
+        rect = find_template_rect(frame, template, threshold=0.85)
+        if rect is not None:
+            matched_template = os.path.basename(tp)
+            matched_rect = rect
+            break
+
+    if matched_rect is None:
+        return False
+
+    print(f"[INFO] 检测到 {matched_template} 满员提示（置信度={matched_rect['max_val']:.4f}），按 Enter 确认后重新识别 e-tip")
+    focus_game_window(hwnd)
+    humanized_press("enter")
+    time.sleep(1.5)
+    ROOMFULL_9001_TRIGGERED = True
+    return True
+
+
 def detect_failure_retry():
     """检测失败重来画面（失败重来.png），检测到后按 N 键继续。
     返回 True 表示检测到了失败重来。
@@ -2124,8 +2183,9 @@ def run_room_progression_loop():
     检测 finish game 或 game failed，检测到后处理并返回。
     添加失败重来检测（失败重来.png）和定时按0逻辑（约4-5分钟随机间隔）。
     进入房间后15分钟内无玩家准备则视为卡死处理。
+    运行全程：超过50分钟从未检测到队友准备绿色对钩 → 强制卡死重启。
     所有时序加入随机扰动，避免固定周期被反作弊检测。"""
-    global STOP_FLAG
+    global STOP_FLAG, LAST_PLAYER_READY_TIME, ROOMFULL_9001_TRIGGERED
 
     print("[INFO] 已进入目标房间，开始按 2 / 0 准备（时序已随机化）")
     cycle_count = 0
@@ -2138,6 +2198,16 @@ def run_room_progression_loop():
     # 9001/roomfull 一般双击后约10秒才弹出；这里先在10秒时点首查，之后每分钟查一次（未检测到玩家准备才查）
     # last_roomfull_check_time 初值比 enter_time 少50秒 → now - last ≈ 50 + elapsed，所以 elapsed>=10 时会满足≥60秒的条件触发首次检查
     last_roomfull_check_time = enter_time - 50.0
+    # 9001roomfull 并行检测：进房间后60秒内每轮循环都快速检测一次（不阻塞2/0按键）
+    roomfull_9001_check_until = enter_time + 60.0
+    # 网络连接中断并行检测：进房间后60秒内每轮循环都快速检测一次
+    conn_fail_check_until = enter_time + 60.0
+    # connectionfailed 模板定期检测：进房间后约10秒首次检查，之后每60秒检查一次（贯穿整局，不限前60秒）
+    #   初值比 enter_time 少50秒 → now - last ≈ 50 + elapsed，elapsed>=10 时满足 ≥60秒，触发首次检查
+    last_conn_fail_check_time = enter_time - 50.0
+    # LAST_PLAYER_READY_TIME 为 None 时（游戏刚启动还没见过准备）用进入房间时间做兜底起点，避免 50 分钟检测误触发
+    if LAST_PLAYER_READY_TIME is None:
+        LAST_PLAYER_READY_TIME = enter_time
 
     while not STOP_FLAG:
         # 卡死检测
@@ -2145,12 +2215,48 @@ def run_room_progression_loop():
             print("[INFO] 游戏已从卡死恢复，中断当前房间循环")
             return False  # 恢复后需要重新走寻路流程
 
-        # roomfull/9001检测：双击后约10秒首次检查；之后每60秒检查一次，且仅在未检测到玩家准备时检查
         now = time.time()
+
+        # ===== 并行检测：进房间后60秒内快速检测 9001roomfull（不阻塞2/0按键）=====
+        if now < roomfull_9001_check_until:
+            if detect_roomfull_9001_and_handle():
+                print("[INFO] 9001roomfull 满员提示已处理，返回重新走 e-tip 识别流程")
+                ROOMFULL_9001_TRIGGERED = False
+                return False
+
+        # ===== 并行检测：进房间后60秒内快速检测网络连接中断（不阻塞2/0按键）=====
+        if now < conn_fail_check_until:
+            if check_connection_failed():
+                print("[INFO] 进入房间后60秒内检测到网络连接中断，已执行恢复流程")
+                return False
+
+        # roomfull/9001检测：双击后约10秒首次检查；之后每60秒检查一次，且仅在未检测到玩家准备时检查
         if (not player_ready_detected) and (now - last_roomfull_check_time >= 60.0):
             last_roomfull_check_time = now
             if detect_room_full():
                 print("[INFO] 定时扫描检测到房间已满/不存在，中断当前房间循环")
+                return False
+
+        # connectionfailed 网络连接中断定期检测：约10秒首次检查，之后每60秒检查一次（贯穿整局，不限前60秒）
+        #   与主循环其他逻辑并行执行，检测到立即走卡死恢复流程（recover_game：关游戏→重开→回私人城镇）
+        if now - last_conn_fail_check_time >= 60.0:
+            last_conn_fail_check_time = now
+            if check_connection_failed():
+                print("[INFO] 定时扫描检测到网络连接中断（connectionfailed），已执行卡死恢复流程，中断当前房间循环")
+                return False
+
+        # ===== 全流程：超过30分钟从未检测到队友准备绿色对钩 → 强制卡死重启 =====
+        if LAST_PLAYER_READY_TIME is not None:
+            minutes_without_ready = (now - LAST_PLAYER_READY_TIME) / 60.0
+            if minutes_without_ready >= 30.0:
+                print(f"[WARN] 超过 {minutes_without_ready:.1f} 分钟未检测到任何队友准备绿色对钩，执行卡死重启流程...")
+                if FREEZE_MONITOR:
+                    FREEZE_MONITOR.reset()
+                success = recover_game()
+                if success:
+                    print("[INFO] 30分钟无准备卡死重启成功，中断当前房间循环")
+                else:
+                    print("[WARN] 30分钟无准备卡死重启失败，中断当前房间循环")
                 return False
 
         # 快速检测断开连接（进入房间后可能直接断连）
@@ -2158,7 +2264,7 @@ def run_room_progression_loop():
             print("[INFO] 进入房间后检测到断连，中断当前房间循环")
             return False
 
-        # 检测10分钟内无玩家准备 → 视为卡死
+        # 进入房间后30分钟内无玩家准备 → 视为卡死（与全局30分钟阈值对齐）
         if not player_ready_detected:
             elapsed = now - enter_time
             print(f"[INFO] 进入房间后无玩家准备，已持续 {elapsed:.1f} 秒...")
@@ -2166,8 +2272,8 @@ def run_room_progression_loop():
                 if check_disconnect_quick():
                     print("[INFO] 无玩家准备超100秒，检测到断开连接，中断当前房间循环")
                     return False
-            if elapsed >= 900:
-                print("[WARN] 进入房间后15分钟内无玩家准备，视为卡死，开始恢复...")
+            if elapsed >= 1800:
+                print("[WARN] 进入房间后30分钟内无玩家准备，视为卡死，开始恢复...")
                 if FREEZE_MONITOR:
                     FREEZE_MONITOR.reset()
                 success = recover_game()
@@ -2415,12 +2521,12 @@ def _find_level10_equipment(hwnd, skip_positions=None):
     time.sleep(1.0)
     result = _find_in_backpack_region(
         hwnd, CONFIG["level10_equipment_template"],
-        threshold=0.65, skip_positions=skip_positions
+        threshold=0.6, skip_positions=skip_positions
     )
     if result is not None:
         print(f"[卖装备] 找到 10 级装备，帧坐标=({result[0]}, {result[1]})，置信度={result[2]:.4f}")
     else:
-        print("[卖装备] 未找到 10 级装备（阈值0.65）")
+        print("[卖装备] 未找到 10 级装备（阈值0.6）")
     pyautogui.keyUp("shift")
     time.sleep(0.5)
     return result
@@ -2657,10 +2763,10 @@ def perform_view_reset_and_restart():
     print("[重置流程] 楼层>320，执行视角重置 + 重启游戏流程…")
     hwnd = find_game_window()
     if hwnd:
-        # 1. 视角左转43.65°（原45°减少3%幅度）
-        print("[重置流程] 1/7 视角左转43.65°（45°×0.97）…")
+        # 1. 视角左转60°
+        print("[重置流程] 1/7 视角左转60°…")
         try:
-            _rotate_view_left_for_reset(45 * 0.97, duration=1.0)
+            _rotate_view_left_for_reset(60, duration=1.0)
         except Exception as e:
             print(f"[重置流程] 视角左转异常，跳过: {e}")
         # 2. 盲按 4 次 W（按 W 期间不再识别 e-reset，只走路），然后直接盲按 E
@@ -2710,7 +2816,7 @@ def perform_view_reset_and_restart():
                     try:
                         frame_cf = capture_game_window(hwnd)
                         tmpl_cf = load_template(confirm_template_path)
-                        found_rect = find_template_rect(frame_cf, tmpl_cf, threshold=CONFIG["match_threshold"])
+                        found_rect = find_template_rect(frame_cf, tmpl_cf, threshold=0.7)
                     except Exception as e:
                         print(f"[重置流程]   resetconfirm识别异常（尝试{confirm_try+1}/3），回退Enter: {e}")
                         found_rect = None
@@ -2987,38 +3093,38 @@ def _detect_chaos9_or_8():
     hwnd = find_game_window()
     frame = capture_game_window(hwnd)
 
-    # 检测 chaos9（高阈值0.95，避免误识别）
+    # 检测 chaos9（高阈值0.9，避免误识别）
     if chaos9_path and os.path.exists(chaos9_path):
-        chaos9_rect = find_template_rect(frame, load_template(chaos9_path), threshold=0.95)
+        chaos9_rect = find_template_rect(frame, load_template(chaos9_path), threshold=0.9)
         if chaos9_rect:
-            print(f"[分屏判断] 识别到 chaos9，相似度={chaos9_rect['max_val']:.4f}（阈值≥0.95），gear分高")
+            print(f"[分屏判断] 识别到 chaos9，相似度={chaos9_rect['max_val']:.4f}（阈值≥0.9），gear分高")
             return "chaos9"
         else:
             debug_rect = find_template_rect(frame, load_template(chaos9_path), threshold=CONFIG["match_threshold"])
             if debug_rect:
-                print(f"[分屏判断] chaos9有疑似匹配相似度={debug_rect['max_val']:.4f} 但<0.95，继续检测chaos10/11")
+                print(f"[分屏判断] chaos9有疑似匹配相似度={debug_rect['max_val']:.4f} 但<0.9，继续检测chaos10/11")
 
-    # 检测 chaos10（高阈值0.95，同chaos9规则）
+    # 检测 chaos10（高阈值0.9，同chaos9规则）
     if chaos10_path and os.path.exists(chaos10_path):
-        chaos10_rect = find_template_rect(frame, load_template(chaos10_path), threshold=0.95)
+        chaos10_rect = find_template_rect(frame, load_template(chaos10_path), threshold=0.9)
         if chaos10_rect:
-            print(f"[分屏判断] 识别到 chaos10，相似度={chaos10_rect['max_val']:.4f}（阈值≥0.95），视为chaos9处理，gear分高")
+            print(f"[分屏判断] 识别到 chaos10，相似度={chaos10_rect['max_val']:.4f}（阈值≥0.9），视为chaos9处理，gear分高")
             return "chaos9"
         else:
             debug_rect = find_template_rect(frame, load_template(chaos10_path), threshold=CONFIG["match_threshold"])
             if debug_rect:
-                print(f"[分屏判断] chaos10有疑似匹配相似度={debug_rect['max_val']:.4f} 但<0.95，继续检测chaos11")
+                print(f"[分屏判断] chaos10有疑似匹配相似度={debug_rect['max_val']:.4f} 但<0.9，继续检测chaos11")
 
-    # 检测 chaos11（高阈值0.95，同chaos9规则）
+    # 检测 chaos11（高阈值0.9，同chaos9规则）
     if chaos11_path and os.path.exists(chaos11_path):
-        chaos11_rect = find_template_rect(frame, load_template(chaos11_path), threshold=0.95)
+        chaos11_rect = find_template_rect(frame, load_template(chaos11_path), threshold=0.9)
         if chaos11_rect:
-            print(f"[分屏判断] 识别到 chaos11，相似度={chaos11_rect['max_val']:.4f}（阈值≥0.95），视为chaos9处理，gear分高")
+            print(f"[分屏判断] 识别到 chaos11，相似度={chaos11_rect['max_val']:.4f}（阈值≥0.9），视为chaos9处理，gear分高")
             return "chaos9"
         else:
             debug_rect = find_template_rect(frame, load_template(chaos11_path), threshold=CONFIG["match_threshold"])
             if debug_rect:
-                print(f"[分屏判断] chaos11有疑似匹配相似度={debug_rect['max_val']:.4f} 但<0.95，继续检测chaos8")
+                print(f"[分屏判断] chaos11有疑似匹配相似度={debug_rect['max_val']:.4f} 但<0.9，继续检测chaos8")
 
     # 检测 chaos8
     if chaos8_path and os.path.exists(chaos8_path):
@@ -3111,8 +3217,9 @@ def enter_browse_defaults_and_judge_chaos():
 
 def _scan_right_panel_room_name():
     """
-    chaos9/10/11后的右侧面板：在difficulty区域内（位置参数类似onslaught房间列表的Floor列）
-    搜索 chaos91011room.png 模板，找到即视为有房间（相当于找到CHAMPION SCORE下方的数字）。
+    chaos9/10/11后的右侧面板：在与 get_target_room_floor 完全相同的大裁剪区域
+    （Frame X:30%-98%, Y:22%-80%）内搜索 chaos91011room.png 模板。
+    找到即视为有房间（等同于识别到 Floor 列/Score列中有合适目标）。
     返回：(has_room, center_frame_or_None)
       - has_room=True 时 center_frame=(fx, fy, conf) 表示模板中心在游戏帧坐标
     """
@@ -3124,26 +3231,18 @@ def _scan_right_panel_room_name():
     frame = capture_game_window(hwnd)
     fh, fw = frame.shape[:2]
 
-    # 先按房间列表整体区域裁剪（与get_target_room_floor相同的整体裁剪区域）：
-    # 宽度：约30%-98%
-    # 高度：约22%-80%
+    # 与 get_target_room_floor 完全一致的整体裁剪区域：
+    # Frame X:30%-98%, Y:22%-80%（不再缩小到 difficulty 子区域）
     crop_x0 = int(fw * 0.30)
     crop_y0 = int(fh * 0.22)
     crop_x1 = int(fw * 0.98)
     crop_y1 = int(fh * 0.80)
-    crop = frame[crop_y0:crop_y1, crop_x0:crop_x1]
-    crop_w = crop.shape[1]
-
-    # difficulty区域（在裁剪区域内的参数类似Floor列）：
-    # Floor列在裁剪区域内占70%-80%，这里沿用相同的比例
-    diff_x0 = int(crop_w * 0.70)
-    diff_x1 = int(crop_w * 0.80)
-    search = crop[:, diff_x0:diff_x1]
+    search = frame[crop_y0:crop_y1, crop_x0:crop_x1]
 
     template = load_template(template_path)
     th, tw = template.shape[:2]
     if search.shape[0] < th or search.shape[1] < tw:
-        print("[右侧房间] difficulty区域搜索区域比模板还小，无法匹配")
+        print("[右侧房间] 房间列表裁剪区域比模板还小，无法匹配")
         return (False, None)
     try:
         res = cv2.matchTemplate(search, template, cv2.TM_CCOEFF_NORMED)
@@ -3152,11 +3251,11 @@ def _scan_right_panel_room_name():
         print(f"[右侧房间] 匹配chaos91011room失败: {e}")
         return (False, None)
     if max_val >= CONFIG["match_threshold"]:
-        fx = diff_x0 + max_loc[0] + tw // 2 + crop_x0
+        fx = max_loc[0] + tw // 2 + crop_x0
         fy = max_loc[1] + th // 2 + crop_y0
-        print(f"[右侧房间] 在difficulty区域找到chaos91011room，置信度={max_val:.4f}，帧坐标=({fx}, {fy})")
+        print(f"[右侧房间] 在房间列表区域(X:30%-98%,Y:22%-80%)找到chaos91011room，置信度={max_val:.4f}，帧坐标=({fx}, {fy})")
         return (True, (fx, fy, max_val))
-    print(f"[右侧房间] difficulty区域未找到chaos91011room（最佳置信度={max_val:.4f}），当前无房间")
+    print(f"[右侧房间] 房间列表区域未找到chaos91011room（最佳置信度={max_val:.4f}），当前无房间")
     return (False, None)
 
 
@@ -3186,14 +3285,27 @@ def enter_right_panel_room_and_run(defaults_center):
     """
     chaos9/10/11分支：不断扫描右侧面板是否存在CHAMPION SCORE数字。
       - 找到 → 双击数字位置进入 → 执行 run_room_progression_loop()
-      - 没找到 → 每10秒在 defaults 原位置点击一下（不移动鼠标），再检查
+      - 没找到 → 每3秒点一次 DEFAULTS 刷新（优先用记录的坐标，否则重新识别DEFAULTS模板，再退而点击游戏画面中间）
+      - 全流程检查：超过30分钟未检测到任何玩家准备绿色对钩 → 强制卡死重启
     """
+    global LAST_PLAYER_READY_TIME
     print("[右侧房间] chaos9/10/11分支：进入右侧房间寻找流程…")
     while not STOP_FLAG:
         # 卡死检测
         if FREEZE_MONITOR and check_and_recover_if_frozen(FREEZE_MONITOR):
             print("[右侧房间] 卡死恢复，退出当前流程")
             return False
+        # ===== 全流程：30 分钟未检测到任何玩家准备 → 强制卡死重启 =====
+        _now_right = time.time()
+        if LAST_PLAYER_READY_TIME is not None:
+            _mins_right = (_now_right - LAST_PLAYER_READY_TIME) / 60.0
+            if _mins_right >= 30.0:
+                print(f"[WARN] [右侧房间] 超过 {_mins_right:.1f} 分钟未检测到任何玩家准备绿色对钩，执行卡死重启流程...")
+                if FREEZE_MONITOR:
+                    FREEZE_MONITOR.reset()
+                recover_game()
+                LAST_PLAYER_READY_TIME = time.time()
+                return False
         has_room, center_frame = _scan_right_panel_room_name()
         if has_room:
             print("[右侧房间] 找到CHAMPION SCORE数字，尝试双击进入…")
@@ -3202,29 +3314,46 @@ def enter_right_panel_room_and_run(defaults_center):
                 # 进入房间后的流程与onslaught相同（按0/2/WSAD等）
                 run_room_progression_loop()
                 return True
-        # 没找到数字 → 每10秒在 defaults 原位置点击一下（不识别模板，直接用记录的坐标点）
-        print("[右侧房间] 无房间数字，10秒后原地点击一下DEFAULTS刷新…")
-        for _ in range(10):
+        # 没找到数字 → 每3秒点一次 DEFAULTS 刷新
+        print("[右侧房间] 无房间数字，3秒后点击 DEFAULTS 刷新…")
+        for _ in range(3):
             if STOP_FLAG:
                 return False
             time.sleep(1.0)
+
+        # --- 点击 DEFAULTS：先使用记录坐标，若不存在则重新识别模板，再不行点击游戏画面中间 ---
+        if defaults_center is None:
+            fresh_center = _get_defaults_screen_center()
+            if fresh_center:
+                defaults_center = fresh_center
+                print(f"[右侧房间] 未记录 defaults 坐标，本轮重新识别成功：{defaults_center}")
+            else:
+                # 还是识别不到 → 点击游戏画面中间作为兜底
+                hwnd = find_game_window()
+                if hwnd:
+                    left, top, right, bottom = get_window_rect(hwnd)
+                    cx = (left + right) // 2
+                    cy = (top + bottom) // 2
+                    defaults_center = (cx, cy)
+                    print(f"[右侧房间] DEFAULTS 模板识别失败，兜底点击游戏画面中间: {defaults_center}")
+                else:
+                    print("[右侧房间] 无 defaults 坐标且找不到游戏窗口，跳过 DEFAULTS 点击")
+                    defaults_center = None
+
         if defaults_center:
             try:
                 sx, sy = defaults_center
-                # 直接在记录的 defaults 中心点击（不做任何模板识别）
                 ctypes.windll.user32.SetCursorPos(sx, sy)
                 time.sleep(0.03)
                 ctypes.windll.user32.mouse_event(0x0002, sx, sy, 0, 0)
                 time.sleep(0.05)
                 ctypes.windll.user32.mouse_event(0x0004, sx, sy, 0, 0)
-                print(f"[右侧房间] 已原地点击 DEFAULTS ({sx}, {sy})")
+                print(f"[右侧房间] 已点击 DEFAULTS ({sx}, {sy})")
             except Exception as e:
-                print(f"[右侧房间] 点击 defaults 失败: {e}，跳过此次刷新")
-        else:
-            # 没有记录到 defaults 坐标时，也不再去识别模板（避免识别不到的警告），直接跳过
-            print("[右侧房间] 未记录 defaults 坐标，跳过 DEFAULTS 点击（下一轮再尝试）")
-        # 点击后再给10秒观察窗口
-        for _ in range(10):
+                print(f"[右侧房间] 点击 DEFAULTS 失败: {e}，跳过此次刷新")
+
+        # 点击后再给3秒观察窗口
+        for _ in range(3):
             if STOP_FLAG:
                 return False
             time.sleep(1.0)
@@ -3290,9 +3419,21 @@ def _scan_rooms_and_run(selected_floor):
     基于已读取的selected_floor，扫描房间列表找floor>=selected_floor的目标房间：
     找到后双击进入并执行房间流程。
     返回: True 表示打完一局成功返回；False 表示卡死/未找到
+    全流程检查：超过30分钟未检测到任何玩家准备绿色对钩 → 强制卡死重启
     """
-    global STOP_FLAG, LAST_COMPLETED_FLOOR, NEED_VIEW_RESET_BEFORE_NEXT_WAR
+    global STOP_FLAG, LAST_COMPLETED_FLOOR, NEED_VIEW_RESET_BEFORE_NEXT_WAR, ROOMFULL_9001_TRIGGERED, LAST_PLAYER_READY_TIME
     while not STOP_FLAG:
+        # ===== 全流程：30 分钟未检测到任何玩家准备 → 强制卡死重启 =====
+        _now_scan = time.time()
+        if LAST_PLAYER_READY_TIME is not None:
+            _mins_scan = (_now_scan - LAST_PLAYER_READY_TIME) / 60.0
+            if _mins_scan >= 30.0:
+                print(f"[WARN] [房间扫描] 超过 {_mins_scan:.1f} 分钟未检测到任何玩家准备绿色对钩，执行卡死重启流程...")
+                if FREEZE_MONITOR:
+                    FREEZE_MONITOR.reset()
+                recover_game()
+                LAST_PLAYER_READY_TIME = time.time()
+                return False
         hwnd = find_game_window()
         focus_game_window(hwnd)
         target_room, all_floors = get_target_room_floor(hwnd, selected_floor)
@@ -3301,6 +3442,7 @@ def _scan_rooms_and_run(selected_floor):
             click_target_room_floor(hwnd, target_room)
             time.sleep(0.5)
             # 进入房间后的自动循环（打完返回True）
+            # 9001roomfull 检测和断连检测都在 run_room_progression_loop 内部并行执行
             ok = run_room_progression_loop()
             if ok:
                 LAST_COMPLETED_FLOOR = selected_floor
@@ -3329,6 +3471,7 @@ def _scan_rooms_and_run(selected_floor):
             if target_room is not None:
                 click_target_room_floor(hwnd, target_room)
                 time.sleep(0.5)
+                # 9001roomfull 检测和断连检测都在 run_room_progression_loop 内部并行执行
                 ok = run_room_progression_loop()
                 if ok:
                     LAST_COMPLETED_FLOOR = selected_floor
@@ -3405,9 +3548,9 @@ def after_e_branch_main():
                     return False
             return ok
         else:
-            # gear_low → 按照用户需求：再次回到正常的进入ONSLAUGHT找合适房间流程，且本次跳过楼层<300判断
-            print("[分支入口] gear_low分支 → 重新走ONSLAUGHT找合适房间（本次跳过楼层<300判断）…")
-            # 此时defaults已经帮我们点过了chaos8/9，要重新点回ONSLAUGHT再找房间
+            # gear_low → 走楼层流程：切回 ONSLAUGHT 找合适房间刷分，
+            # 打完后下一轮回来会重新换装备 + 检测 gear 分，直到能识别到 chaos9/10/11 才走右侧chaos房间路径
+            print("[分支入口] gear_low分支 → 切回 ONSLAUGHT 找合适房间刷分（打完后再回来检测 gear 分）…")
             sf2 = _open_onslaught_and_read_floor()
             if sf2 is None:
                 print("[WARN] gear_low后重试读取楼层失败，终止流程")
@@ -3421,47 +3564,58 @@ def after_e_branch_main():
                 recover_game()
                 return False
             print(f"[分支入口] gear_low重入后读取 Selected Floor = {sf2}")
-            SKIP_FLOOR_CHECK_THIS_ROUND = False
             ok = _scan_rooms_and_run(sf2)
             return ok
     else:
-        # 楼层 >= 300，先执行简化卖装备流程（不换装），然后再按E → 读楼层 → 找房间
-        print(f"[分支入口] 楼层 {selected_floor}>=300，先执行简化卖装备（不换装）再找房间")
-        # 1. 简化卖装备（ESC→按I→找背包1点击→保护10级→按Y卖→ESC关背包）
-        perform_sell_only_no_switch()
-        # 2. 卖完装备后，当前还在城堡，按E回到War Table交互界面（需先确保在War Table旁，一般卖装备退出来仍在旁边，识别e-tip后按E）
-        print("[分支入口] 卖装备完成，回到War Table旁识别e-tip并按E…")
-        hwnd = find_game_window()
-        etip_ok = False
-        for _a in range(10):
-            if STOP_FLAG:
-                break
-            if detect_e_tip(hwnd) is not None:
-                humanized_press("e")
-                time.sleep(0.8)
-                etip_ok = True
-                break
-            # 没识别到，按一下W微调位置
-            humanized_press("w")
-            time.sleep(0.3)
-        if not etip_ok:
-            print("[WARN] 卖装备后按E失败，尝试直接走ONSLAUGHT流程…")
-        # 3. 重新走ONSLAUGHT→BROWSE→读Selected Floor，然后判断楼层
-        sf_new = _open_onslaught_and_read_floor()
-        if sf_new is None:
-            print("[WARN] 卖装备后重新读取楼层失败，终止流程")
-            return False
-        if sf_new > 320:
-            print(f"[分支入口] 卖装备后读取 Selected Floor = {sf_new}>320，立即执行卡死重启 + 下一次识别到War Table后执行视角专项")
+        # 楼层 >= 300 分两种情况：
+        #   300~320：还没到 Ancient Power 门槛，继续简化卖装备（不换装）→ 找合适楼层房间推进
+        #   > 320：才走卡死重启 + 下一次识别到 War Table 后执行视角专项（reset）
+        if selected_floor <= 320:
+            print(f"[分支入口] 楼层 {selected_floor} 在 300~320 之间，继续简化卖装备（不换装）→ 找合适楼层房间推进")
+            # 1. 简化卖装备（ESC→按I→找背包1点击→保护10级→按Y卖→ESC关背包）
+            perform_sell_only_no_switch()
+            # 2. 卖完装备后，当前还在城堡，按E回到War Table交互界面
+            print("[分支入口] 卖装备完成，回到War Table旁识别e-tip并按E…")
+            hwnd = find_game_window()
+            etip_ok = False
+            for _a in range(10):
+                if STOP_FLAG:
+                    break
+                if detect_e_tip(hwnd) is not None:
+                    humanized_press("e")
+                    time.sleep(0.8)
+                    etip_ok = True
+                    break
+                # 没识别到，按一下W微调位置
+                humanized_press("w")
+                time.sleep(0.3)
+            if not etip_ok:
+                print("[WARN] 卖装备后按E失败，尝试直接走ONSLAUGHT流程…")
+            # 3. 重新走ONSLAUGHT→BROWSE→读Selected Floor，然后找合适房间
+            sf_new = _open_onslaught_and_read_floor()
+            if sf_new is None:
+                print("[WARN] 卖装备后重新读取楼层失败，终止流程")
+                return False
+            if sf_new > 320:
+                print(f"[分支入口] 卖装备后读取 Selected Floor = {sf_new}>320，立即执行卡死重启 + 下一次识别到War Table后执行视角专项")
+                NEED_VIEW_RESET_BEFORE_NEXT_WAR = True
+                LAST_COMPLETED_FLOOR = sf_new
+                if FREEZE_MONITOR:
+                    FREEZE_MONITOR.reset()
+                recover_game()
+                return False
+            print(f"[分支入口] 卖装备后读取 Selected Floor = {sf_new}，开始找合适房间")
+            ok = _scan_rooms_and_run(sf_new)
+            return ok
+        else:
+            # 楼层 > 320，直接卡死重启 + 下一次识别到 War Table 后执行视角专项（reset）
+            print(f"[分支入口] 楼层 {selected_floor}>320，直接执行卡死重启 + 视角专项（reset）流程")
             NEED_VIEW_RESET_BEFORE_NEXT_WAR = True
-            LAST_COMPLETED_FLOOR = sf_new
+            LAST_COMPLETED_FLOOR = selected_floor
             if FREEZE_MONITOR:
                 FREEZE_MONITOR.reset()
             recover_game()
             return False
-        print(f"[分支入口] 卖装备后读取 Selected Floor = {sf_new}，开始找合适房间")
-        ok = _scan_rooms_and_run(sf_new)
-        return ok
 
 
 # ========================= 自动寻路主逻辑 =========================
@@ -3591,8 +3745,8 @@ def walk_to_war_table_and_press_e():
 
     hwnd = find_game_window()
 
-    print("[INFO] 3 秒后开始自动寻路…")
-    time.sleep(3)
+    print("[INFO] 1 秒后开始自动寻路…")
+    time.sleep(1)
 
     # —— 视角重置专项入口：若标记为 True，先识别一次 War Table 并执行专项
     if NEED_VIEW_RESET_BEFORE_NEXT_WAR:
@@ -3615,9 +3769,9 @@ def walk_to_war_table_and_press_e():
         move_forward_once()
         time.sleep(0.4)
 
-    # 2) 走完 4 步后停顿 2 秒，让画面稳定再识别 E（避免运动模糊导致误匹配）
-    print("[INFO] 停顿 2 秒，等待画面稳定后识别 E 提示...")
-    time.sleep(2)
+    # 2) 走完 4 步后停顿 0.5 秒，让画面稳定再识别 E（避免运动模糊导致误匹配）
+    print("[INFO] 停顿 0.5 秒，等待画面稳定后识别 E 提示...")
+    time.sleep(0.5)
 
     # 被踢检测
     if check_kicked_quick():
@@ -3634,18 +3788,12 @@ def walk_to_war_table_and_press_e():
     # 3) 未识别到 E，每走 1 步停顿一下再识别，直到识别出来为止
     print("[INFO] 未识别到 E 提示，开始每走 1 步停顿识别一次...")
     walk_step_count = 0
-    max_walk_steps = 120  # 安全上限，防止无限行走
+    max_walk_steps = 10  # 连续 10 次未识别到 E 提示，走卡死重启流程
 
     while not STOP_FLAG and walk_step_count < max_walk_steps:
         # 被踢检测
         if check_kicked_quick():
             return False  # 被踢恢复后重新开始寻路
-
-        # 卡死检测（每走 10 步检查一次）
-        if walk_step_count % 10 == 9 and FREEZE_MONITOR:
-            if check_and_recover_if_frozen(FREEZE_MONITOR):
-                print("[INFO] 寻路过程中游戏卡死并已恢复，重新开始寻路")
-                return False
 
         # 朝前走 1 步
         move_forward_once()
@@ -3663,7 +3811,9 @@ def walk_to_war_table_and_press_e():
             return True
 
     if walk_step_count >= max_walk_steps:
-        print(f"[WARN] 已走 {max_walk_steps} 步仍未识别到 E 提示，返回重试")
+        print(f"[WARN] 连续 {max_walk_steps} 次未识别到 E 提示，执行卡死重启流程...")
+        recover_game()
+        return False
     else:
         print("[INFO] 脚本已停止")
     return False
@@ -3852,9 +4002,23 @@ if __name__ == "__main__":
         dpi_scale = get_system_dpi_scale()
         print(f"[INFO] 卡死检测已启用，将在运行过程中持续监控游戏状态（系统DPI缩放={dpi_scale}）")
 
+        # 初始化 50 分钟无队友准备计时起点（游戏刚启动还没进房间，这里设当前时间）
+        if LAST_PLAYER_READY_TIME is None:
+            LAST_PLAYER_READY_TIME = time.time()
         last_disconnect_check_time = time.time()
 
         while not STOP_FLAG:
+            # ===== 全流程：30 分钟未检测到任何队友准备绿色对钩 → 强制卡死重启（防止长时间停留在右侧面板/房间列表等流程时漏检）=====
+            _now_out = time.time()
+            if LAST_PLAYER_READY_TIME is not None:
+                _mins = (_now_out - LAST_PLAYER_READY_TIME) / 60.0
+                if _mins >= 30.0:
+                    print(f"[WARN] 主循环：超过 {_mins:.1f} 分钟未检测到任何队友准备绿色对钩，执行卡死重启流程...")
+                    if FREEZE_MONITOR:
+                        FREEZE_MONITOR.reset()
+                    recover_game()
+                    LAST_PLAYER_READY_TIME = time.time()
+                    continue
             # 被踢检测（优先级最高，先于卡死检测）
             if check_kicked_quick():
                 continue
@@ -4069,8 +4233,9 @@ if __name__ == "__main__":
                         continue
                     # 走楼层分支入口（内部处理换装、chaos判断、右侧面板/onslaught等）
                     after_e_branch_main()
-                    print("[INFO] 已返回城堡，等待 60 秒后开始下一轮寻路")
-                    time.sleep(60)
+                    # after_e_branch_main 内部已经处理了卡死+reset视角的流程，
+                    # 返回后游戏已在城堡界面（recover_game 中 detect_war_table 已识别到），无需再等 60 秒
+                    print("[INFO] 已返回城堡，立即开始下一轮寻路")
                 time.sleep(1.0)
         else:
             print(f"[ERROR] 脚本异常: {e}")
