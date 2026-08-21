@@ -10,7 +10,7 @@
 # 6) 如果列表中找不到目标房间，点击 REFRESH 后每 4 秒检测一次，最多等 20 秒
 #
 # 异常处理：
-# - 卡死检测：黑屏/静止超 3 分钟 或 Connection timed out 超 10 秒 → 自动关闭并重启游戏
+# - 卡死检测：黑屏超 6 分钟、画面静止超 20 分钟或 Connection timed out 超 10 秒 → 自动关闭并重启游戏
 # - 游戏失败：检测到 gamefailed.png → 按 N 键继续
 # - 被踢出房间：检测到 bekick.png → 点击 kickok → 点击私人城镇 → 等 30 秒重新开始
 # - F12 热键随时停止脚本
@@ -177,8 +177,10 @@ LAST_ROUND_HAD_GEAR_CHECK = False     # 上一轮是否做过换装判断（用�
 NEED_RESET_AFTER_ROUND = False        # 保留变量名，不再使用
 LAST_COMPLETED_FLOOR = None           # 上一次完整打完的Selected Floor数字，用于判断是否>320
 NEED_VIEW_RESET_BEFORE_NEXT_WAR = False  # True 时：下一次 walk_to_war_table 识别到War Table之后、按E之前，执行视角专项→再卡死重启
-LAST_PLAYER_READY_TIME = None         # 最近一次检测到队友准备（绿色对钩）的时间戳，用于30分钟无准备卡死重启（全流程适用）
+LAST_PLAYER_READY_TIME = None         # 最近一次检测到队友准备（绿色对钩）的时间戳，用于40分钟无准备卡死重启（全流程适用）
 ROOMFULL_9001_TRIGGERED = False       # 双击房间后1分钟内检测到9001roomfull时标记为True，跳过run_room_progression_loop直接重新识别e-tip
+NO_PLAYER_READY_TIMEOUT_MINUTES = 40.0
+NO_PLAYER_READY_TIMEOUT_SECONDS = NO_PLAYER_READY_TIMEOUT_MINUTES * 60
 
 # ========================= 卡死检测配置（来自 dd2gamedie.py） =========================
 # 模板路径：卡死恢复流程中需要用到的图像（关闭游戏、Steam 重启等）
@@ -187,6 +189,7 @@ FREEZE_SCRIPT_DIR = r"D:\DD2脚本\DD2ganmedie"
 TEMPLATE_STOP = os.path.join(FREEZE_SCRIPT_DIR, "停止.png")
 TEMPLATE_CONFIRM = os.path.join(FREEZE_SCRIPT_DIR, "确认.png")
 TEMPLATE_START_GAME = os.path.join(FREEZE_SCRIPT_DIR, "开始游戏.png")
+TEMPLATE_GAME_END = os.path.join(FREEZE_SCRIPT_DIR, "gameend.png")
 TEMPLATE_STEAM = os.path.join(FREEZE_SCRIPT_DIR, "steam.png")
 TEMPLATE_PRIVATE_TAVERN = os.path.join(FREEZE_SCRIPT_DIR, "私人城镇.png")
 TEMPLATE_DISCONNECT = os.path.join(FREEZE_SCRIPT_DIR, "断开连接.png")
@@ -195,9 +198,32 @@ TEMPLATE_CANCEL = os.path.join(FREEZE_SCRIPT_DIR, "取消.png")
 FREEZE_MATCH_THRESHOLD = 0.7
 FREEZE_BLACK_RATIO = 0.95
 FREEZE_DARK_THRESHOLD = 30
-FREEZE_DURATION = 360         # 秒，黑屏/静止超过此时长判定卡死（6分钟）
+FREEZE_DURATION = 360         # 秒，黑屏超过此时长判定卡死（6分钟）
+STATIC_FREEZE_DURATION = 1200 # 秒，画面连续静止超过此时长判定卡死（20分钟）
 STATIC_SIMILARITY = 0.97      # 画面相似度高于此值视为无变化
 DISCONNECT_DURATION = 10      # 秒，断开连接提示持续多久判定卡死
+
+# Windows 运行状态：脚本运行期间阻止系统自动睡眠、息屏和由空闲触发的锁屏。
+ES_CONTINUOUS = 0x80000000
+ES_SYSTEM_REQUIRED = 0x00000001
+ES_DISPLAY_REQUIRED = 0x00000002
+
+
+def enable_system_keep_awake():
+    """保持系统和显示器唤醒，避免自动锁屏导致游戏截图失败。"""
+    result = ctypes.windll.kernel32.SetThreadExecutionState(
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+    )
+    if result:
+        print("[INFO] 已启用防睡眠/防息屏，脚本运行期间系统将保持唤醒")
+        return True
+    print("[WARN] 启用防睡眠/防息屏失败，锁屏后截图可能暂时不可用")
+    return False
+
+
+def disable_system_keep_awake():
+    """恢复 Windows 默认电源管理行为。"""
+    ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
 
 
 # ========================= 卡死检测与恢复模块 =========================
@@ -206,7 +232,7 @@ class GameFreezeMonitor:
     """游戏卡死监视器，每次调用 check() 做单次采样，跨调用累积状态。
     三种判定方式：
     1. 黑屏超过 FREEZE_DURATION 秒
-    2. 画面长时间基本无变化超过 FREEZE_DURATION 秒
+    2. 画面长时间基本无变化超过 STATIC_FREEZE_DURATION 秒
     3. 出现断开连接提示超过 DISCONNECT_DURATION 秒
     """
 
@@ -240,7 +266,9 @@ class GameFreezeMonitor:
                     np.array(sct.grab(monitor)), cv2.COLOR_BGRA2BGR
                 )
         except Exception as e:
-            print(f"[卡死检测] 截屏失败: {e}")
+            # 锁屏期间没有有效采样，不能把这段时间计入连续黑屏/静止时长。
+            self.reset()
+            print(f"[卡死检测] 截屏失败，已暂停并重置画面计时: {e}")
             return False
 
         h, w = screen.shape[:2]
@@ -288,8 +316,8 @@ class GameFreezeMonitor:
                 else:
                     elapsed = now - self.static_start_time
                     print(f"[卡死检测] 画面基本无变化（相似度: {similarity:.4f}），已持续 {elapsed:.1f} 秒...")
-                    if elapsed >= FREEZE_DURATION:
-                        print(f"[卡死检测] 画面静止已超过 {FREEZE_DURATION} 秒，判定游戏卡死！")
+                    if elapsed >= STATIC_FREEZE_DURATION:
+                        print(f"[卡死检测] 画面静止已超过 {STATIC_FREEZE_DURATION} 秒，判定游戏卡死！")
                         return True
                     if elapsed >= 100:
                         disconnect_pos = _find_image_on_screen(TEMPLATE_DISCONNECT, threshold=0.7)
@@ -575,12 +603,21 @@ def recover_game():
     # 第6步：等待"开始游戏"按钮出现并点击
     print("[恢复] 等待'开始游戏'按钮出现...")
     start_pos = None
+    game_end_clicked = False
     for attempt in range(30):
         start_pos = _find_image_on_screen(TEMPLATE_START_GAME, threshold=FREEZE_MATCH_THRESHOLD)
         if start_pos:
             print(f"[恢复] 找到'开始游戏'按钮，位置: ({start_pos[0]}, {start_pos[1]})")
             _click_at(start_pos[0], start_pos[1], delay=0.5)
             break
+        if attempt >= 9 and not game_end_clicked:
+            game_end_pos = _find_image_on_screen(TEMPLATE_GAME_END, threshold=FREEZE_MATCH_THRESHOLD)
+            if game_end_pos:
+                print(f"[恢复] 连续10次未找到'开始游戏'，检测到 gameend，点击位置: ({game_end_pos[0]}, {game_end_pos[1]})")
+                _click_at(game_end_pos[0], game_end_pos[1], delay=0.5)
+                game_end_clicked = True
+                time.sleep(2)
+                continue
         print(f"[恢复] 未找到'开始游戏'按钮，重试 {attempt + 1}/30...")
         time.sleep(2)
 
@@ -656,12 +693,21 @@ def recover_game():
         # 找"开始游戏"按钮并点击
         print("[恢复] 查找'开始游戏'按钮...")
         start_pos = None
+        game_end_clicked = False
         for attempt in range(30):
             start_pos = _find_image_on_screen(TEMPLATE_START_GAME, threshold=FREEZE_MATCH_THRESHOLD)
             if start_pos:
                 print(f"[恢复] 找到'开始游戏'按钮，位置: ({start_pos[0]}, {start_pos[1]})")
                 _click_at(start_pos[0], start_pos[1], delay=0.5)
                 break
+            if attempt >= 9 and not game_end_clicked:
+                game_end_pos = _find_image_on_screen(TEMPLATE_GAME_END, threshold=FREEZE_MATCH_THRESHOLD)
+                if game_end_pos:
+                    print(f"[恢复] 连续10次未找到'开始游戏'，检测到 gameend，点击位置: ({game_end_pos[0]}, {game_end_pos[1]})")
+                    _click_at(game_end_pos[0], game_end_pos[1], delay=0.5)
+                    game_end_clicked = True
+                    time.sleep(2)
+                    continue
             print(f"[恢复] 未找到'开始游戏'按钮，重试 {attempt + 1}/30...")
             time.sleep(2)
 
@@ -876,38 +922,90 @@ def get_client_size(hwnd):
         return 1600, 900
 
 
-def capture_game_window(hwnd):
-    """使用 mss 截取游戏窗口当前画面，返回 BGR 图像。"""
-    x, y, width, height = get_window_rect(hwnd)
-    if width <= 0 or height <= 0:
-        raise RuntimeError("游戏窗口尺寸无效")
+def _capture_with_desktop_retry(capture_func):
+    """桌面锁定导致 BitBlt 被拒绝时等待恢复，避免异常终止整个脚本。"""
+    retry_started_at = None
+    last_log_at = 0.0
 
-    with mss.mss() as sct:
-        monitor = {"left": x, "top": y, "width": width, "height": height}
-        img = np.array(sct.grab(monitor))
-    return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    while not STOP_FLAG:
+        try:
+            image = capture_func()
+            if retry_started_at is not None:
+                waited = time.time() - retry_started_at
+                print(f"[截图] 桌面截图已恢复，等待 {waited:.1f} 秒后继续原流程")
+            return image
+        except Exception as exc:
+            error_text = str(exc).lower()
+            desktop_unavailable = (
+                "bitblt" in error_text
+                or "拒绝访问" in error_text
+                or "access is denied" in error_text
+            )
+            if not desktop_unavailable:
+                raise
+
+            now = time.time()
+            if retry_started_at is None:
+                retry_started_at = now
+            if now - last_log_at >= 30.0:
+                print(f"[WARN] 桌面可能已锁定，截图暂时不可用；每 5 秒重试，不会终止脚本：{exc}")
+                last_log_at = now
+            for _ in range(5):
+                if STOP_FLAG:
+                    break
+                time.sleep(1.0)
+
+    raise RuntimeError("收到停止信号，停止等待桌面截图恢复")
+
+
+def capture_game_window(hwnd):
+    """使用 mss 截取游戏窗口当前画面；锁屏时等待恢复后继续。"""
+    def _grab():
+        x, y, width, height = get_window_rect(hwnd)
+        if width <= 0 or height <= 0:
+            raise RuntimeError("游戏窗口尺寸无效")
+
+        with mss.mss() as sct:
+            monitor = {"left": x, "top": y, "width": width, "height": height}
+            img = np.array(sct.grab(monitor))
+        return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+
+    return _capture_with_desktop_retry(_grab)
 
 
 def capture_client_region(hwnd, left, top, width, height):
-    """截取客户区指定区域（与 dd2_full.py 保持一致）"""
-    hdc_window = win32gui.GetDC(hwnd)
-    hdc_mem = win32gui.CreateCompatibleDC(hdc_window)
-    hbmp = win32gui.CreateCompatibleBitmap(hdc_window, width, height)
-    old_bmp = win32gui.SelectObject(hdc_mem, hbmp)
-    
-    win32gui.BitBlt(hdc_mem, 0, 0, width, height, hdc_window, left, top, win32con.SRCCOPY)
-    
-    hbmp_obj = win32ui.CreateBitmapFromHandle(hbmp)
-    bmp_str = hbmp_obj.GetBitmapBits(True)
-    img = np.frombuffer(bmp_str, dtype=np.uint8).reshape((height, width, 4))
-    img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-    
-    win32gui.SelectObject(hdc_mem, old_bmp)
-    win32gui.DeleteObject(hbmp)
-    win32gui.DeleteDC(hdc_mem)
-    win32gui.ReleaseDC(hwnd, hdc_window)
-    
-    return img
+    """截取客户区指定区域；锁屏时等待恢复，并确保每次尝试都释放 GDI 资源。"""
+    def _grab():
+        hdc_window = None
+        hdc_mem = None
+        hbmp = None
+        old_bmp = None
+        try:
+            hdc_window = win32gui.GetDC(hwnd)
+            hdc_mem = win32gui.CreateCompatibleDC(hdc_window)
+            hbmp = win32gui.CreateCompatibleBitmap(hdc_window, width, height)
+            old_bmp = win32gui.SelectObject(hdc_mem, hbmp)
+
+            win32gui.BitBlt(
+                hdc_mem, 0, 0, width, height,
+                hdc_window, left, top, win32con.SRCCOPY
+            )
+
+            hbmp_obj = win32ui.CreateBitmapFromHandle(hbmp)
+            bmp_str = hbmp_obj.GetBitmapBits(True)
+            img = np.frombuffer(bmp_str, dtype=np.uint8).reshape((height, width, 4))
+            return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+        finally:
+            if hdc_mem and old_bmp:
+                win32gui.SelectObject(hdc_mem, old_bmp)
+            if hbmp:
+                win32gui.DeleteObject(hbmp)
+            if hdc_mem:
+                win32gui.DeleteDC(hdc_mem)
+            if hdc_window:
+                win32gui.ReleaseDC(hwnd, hdc_window)
+
+    return _capture_with_desktop_retry(_grab)
 
 
 # ========================= 图像识别模块 =========================
@@ -2183,7 +2281,7 @@ def run_room_progression_loop():
     检测 finish game 或 game failed，检测到后处理并返回。
     添加失败重来检测（失败重来.png）和定时按0逻辑（约4-5分钟随机间隔）。
     进入房间后15分钟内无玩家准备则视为卡死处理。
-    运行全程：超过50分钟从未检测到队友准备绿色对钩 → 强制卡死重启。
+    运行全程：超过40分钟从未检测到队友准备绿色对钩 → 强制卡死重启。
     所有时序加入随机扰动，避免固定周期被反作弊检测。"""
     global STOP_FLAG, LAST_PLAYER_READY_TIME, ROOMFULL_9001_TRIGGERED
 
@@ -2205,7 +2303,7 @@ def run_room_progression_loop():
     # connectionfailed 模板定期检测：进房间后约10秒首次检查，之后每60秒检查一次（贯穿整局，不限前60秒）
     #   初值比 enter_time 少50秒 → now - last ≈ 50 + elapsed，elapsed>=10 时满足 ≥60秒，触发首次检查
     last_conn_fail_check_time = enter_time - 50.0
-    # LAST_PLAYER_READY_TIME 为 None 时（游戏刚启动还没见过准备）用进入房间时间做兜底起点，避免 50 分钟检测误触发
+    # LAST_PLAYER_READY_TIME 为 None 时（游戏刚启动还没见过准备）用进入房间时间做兜底起点，避免 40 分钟检测误触发
     if LAST_PLAYER_READY_TIME is None:
         LAST_PLAYER_READY_TIME = enter_time
 
@@ -2245,18 +2343,18 @@ def run_room_progression_loop():
                 print("[INFO] 定时扫描检测到网络连接中断（connectionfailed），已执行卡死恢复流程，中断当前房间循环")
                 return False
 
-        # ===== 全流程：超过30分钟从未检测到队友准备绿色对钩 → 强制卡死重启 =====
+        # ===== 全流程：超过40分钟从未检测到队友准备绿色对钩 → 强制卡死重启 =====
         if LAST_PLAYER_READY_TIME is not None:
             minutes_without_ready = (now - LAST_PLAYER_READY_TIME) / 60.0
-            if minutes_without_ready >= 30.0:
+            if minutes_without_ready >= NO_PLAYER_READY_TIMEOUT_MINUTES:
                 print(f"[WARN] 超过 {minutes_without_ready:.1f} 分钟未检测到任何队友准备绿色对钩，执行卡死重启流程...")
                 if FREEZE_MONITOR:
                     FREEZE_MONITOR.reset()
                 success = recover_game()
                 if success:
-                    print("[INFO] 30分钟无准备卡死重启成功，中断当前房间循环")
+                    print("[INFO] 40分钟无准备卡死重启成功，中断当前房间循环")
                 else:
-                    print("[WARN] 30分钟无准备卡死重启失败，中断当前房间循环")
+                    print("[WARN] 40分钟无准备卡死重启失败，中断当前房间循环")
                 return False
 
         # 快速检测断开连接（进入房间后可能直接断连）
@@ -2264,7 +2362,7 @@ def run_room_progression_loop():
             print("[INFO] 进入房间后检测到断连，中断当前房间循环")
             return False
 
-        # 进入房间后30分钟内无玩家准备 → 视为卡死（与全局30分钟阈值对齐）
+        # 进入房间后40分钟内无玩家准备 → 视为卡死（与全局40分钟阈值对齐）
         if not player_ready_detected:
             elapsed = now - enter_time
             print(f"[INFO] 进入房间后无玩家准备，已持续 {elapsed:.1f} 秒...")
@@ -2272,8 +2370,8 @@ def run_room_progression_loop():
                 if check_disconnect_quick():
                     print("[INFO] 无玩家准备超100秒，检测到断开连接，中断当前房间循环")
                     return False
-            if elapsed >= 1800:
-                print("[WARN] 进入房间后30分钟内无玩家准备，视为卡死，开始恢复...")
+            if elapsed >= NO_PLAYER_READY_TIMEOUT_SECONDS:
+                print("[WARN] 进入房间后40分钟内无玩家准备，视为卡死，开始恢复...")
                 if FREEZE_MONITOR:
                     FREEZE_MONITOR.reset()
                 success = recover_game()
@@ -3286,7 +3384,7 @@ def enter_right_panel_room_and_run(defaults_center):
     chaos9/10/11分支：不断扫描右侧面板是否存在CHAMPION SCORE数字。
       - 找到 → 双击数字位置进入 → 执行 run_room_progression_loop()
       - 没找到 → 每3秒点一次 DEFAULTS 刷新（优先用记录的坐标，否则重新识别DEFAULTS模板，再退而点击游戏画面中间）
-      - 全流程检查：超过30分钟未检测到任何玩家准备绿色对钩 → 强制卡死重启
+      - 全流程检查：超过40分钟未检测到任何玩家准备绿色对钩 → 强制卡死重启
     """
     global LAST_PLAYER_READY_TIME
     print("[右侧房间] chaos9/10/11分支：进入右侧房间寻找流程…")
@@ -3295,11 +3393,11 @@ def enter_right_panel_room_and_run(defaults_center):
         if FREEZE_MONITOR and check_and_recover_if_frozen(FREEZE_MONITOR):
             print("[右侧房间] 卡死恢复，退出当前流程")
             return False
-        # ===== 全流程：30 分钟未检测到任何玩家准备 → 强制卡死重启 =====
+        # ===== 全流程：40 分钟未检测到任何玩家准备 → 强制卡死重启 =====
         _now_right = time.time()
         if LAST_PLAYER_READY_TIME is not None:
             _mins_right = (_now_right - LAST_PLAYER_READY_TIME) / 60.0
-            if _mins_right >= 30.0:
+            if _mins_right >= NO_PLAYER_READY_TIMEOUT_MINUTES:
                 print(f"[WARN] [右侧房间] 超过 {_mins_right:.1f} 分钟未检测到任何玩家准备绿色对钩，执行卡死重启流程...")
                 if FREEZE_MONITOR:
                     FREEZE_MONITOR.reset()
@@ -3419,15 +3517,15 @@ def _scan_rooms_and_run(selected_floor):
     基于已读取的selected_floor，扫描房间列表找floor>=selected_floor的目标房间：
     找到后双击进入并执行房间流程。
     返回: True 表示打完一局成功返回；False 表示卡死/未找到
-    全流程检查：超过30分钟未检测到任何玩家准备绿色对钩 → 强制卡死重启
+    全流程检查：超过40分钟未检测到任何玩家准备绿色对钩 → 强制卡死重启
     """
     global STOP_FLAG, LAST_COMPLETED_FLOOR, NEED_VIEW_RESET_BEFORE_NEXT_WAR, ROOMFULL_9001_TRIGGERED, LAST_PLAYER_READY_TIME
     while not STOP_FLAG:
-        # ===== 全流程：30 分钟未检测到任何玩家准备 → 强制卡死重启 =====
+        # ===== 全流程：40 分钟未检测到任何玩家准备 → 强制卡死重启 =====
         _now_scan = time.time()
         if LAST_PLAYER_READY_TIME is not None:
             _mins_scan = (_now_scan - LAST_PLAYER_READY_TIME) / 60.0
-            if _mins_scan >= 30.0:
+            if _mins_scan >= NO_PLAYER_READY_TIMEOUT_MINUTES:
                 print(f"[WARN] [房间扫描] 超过 {_mins_scan:.1f} 分钟未检测到任何玩家准备绿色对钩，执行卡死重启流程...")
                 if FREEZE_MONITOR:
                     FREEZE_MONITOR.reset()
@@ -3825,6 +3923,7 @@ def walk_to_war_table_and_press_e():
 
 if __name__ == "__main__":
     register_stop_hotkey()
+    enable_system_keep_awake()
 
     print("=" * 70)
     print("DD2 自动寻路到 War Table 并按 E 打开界面")
@@ -3899,12 +3998,21 @@ if __name__ == "__main__":
                 # 找"开始游戏"按钮并点击
                 print("[INFO] 查找'开始游戏'按钮...")
                 start_pos = None
+                game_end_clicked = False
                 for attempt in range(30):
                     start_pos = _find_image_on_screen(TEMPLATE_START_GAME, threshold=FREEZE_MATCH_THRESHOLD)
                     if start_pos:
                         print(f"[INFO] 找到'开始游戏'按钮，位置: ({start_pos[0]}, {start_pos[1]})")
                         _click_at(start_pos[0], start_pos[1], delay=0.5)
                         break
+                    if attempt >= 9 and not game_end_clicked:
+                        game_end_pos = _find_image_on_screen(TEMPLATE_GAME_END, threshold=FREEZE_MATCH_THRESHOLD)
+                        if game_end_pos:
+                            print(f"[INFO] 连续10次未找到'开始游戏'，检测到 gameend，点击位置: ({game_end_pos[0]}, {game_end_pos[1]})")
+                            _click_at(game_end_pos[0], game_end_pos[1], delay=0.5)
+                            game_end_clicked = True
+                            time.sleep(2)
+                            continue
                     print(f"[INFO] 未找到'开始游戏'按钮，重试 {attempt + 1}/30...")
                     time.sleep(2)
 
@@ -4002,17 +4110,17 @@ if __name__ == "__main__":
         dpi_scale = get_system_dpi_scale()
         print(f"[INFO] 卡死检测已启用，将在运行过程中持续监控游戏状态（系统DPI缩放={dpi_scale}）")
 
-        # 初始化 50 分钟无队友准备计时起点（游戏刚启动还没进房间，这里设当前时间）
+        # 初始化 40 分钟无队友准备计时起点（游戏刚启动还没进房间，这里设当前时间）
         if LAST_PLAYER_READY_TIME is None:
             LAST_PLAYER_READY_TIME = time.time()
         last_disconnect_check_time = time.time()
 
         while not STOP_FLAG:
-            # ===== 全流程：30 分钟未检测到任何队友准备绿色对钩 → 强制卡死重启（防止长时间停留在右侧面板/房间列表等流程时漏检）=====
+            # ===== 全流程：40 分钟未检测到任何队友准备绿色对钩 → 强制卡死重启（防止长时间停留在右侧面板/房间列表等流程时漏检）=====
             _now_out = time.time()
             if LAST_PLAYER_READY_TIME is not None:
                 _mins = (_now_out - LAST_PLAYER_READY_TIME) / 60.0
-                if _mins >= 30.0:
+                if _mins >= NO_PLAYER_READY_TIMEOUT_MINUTES:
                     print(f"[WARN] 主循环：超过 {_mins:.1f} 分钟未检测到任何队友准备绿色对钩，执行卡死重启流程...")
                     if FREEZE_MONITOR:
                         FREEZE_MONITOR.reset()
@@ -4128,12 +4236,21 @@ if __name__ == "__main__":
                     time.sleep(1)
                 print("[INFO] 查找'开始游戏'按钮...")
                 start_pos = None
+                game_end_clicked = False
                 for attempt in range(30):
                     start_pos = _find_image_on_screen(TEMPLATE_START_GAME, threshold=FREEZE_MATCH_THRESHOLD)
                     if start_pos:
                         print(f"[INFO] 找到'开始游戏'按钮，位置: ({start_pos[0]}, {start_pos[1]})")
                         _click_at(start_pos[0], start_pos[1], delay=0.5)
                         break
+                    if attempt >= 9 and not game_end_clicked:
+                        game_end_pos = _find_image_on_screen(TEMPLATE_GAME_END, threshold=FREEZE_MATCH_THRESHOLD)
+                        if game_end_pos:
+                            print(f"[INFO] 连续10次未找到'开始游戏'，检测到 gameend，点击位置: ({game_end_pos[0]}, {game_end_pos[1]})")
+                            _click_at(game_end_pos[0], game_end_pos[1], delay=0.5)
+                            game_end_clicked = True
+                            time.sleep(2)
+                            continue
                     print(f"[INFO] 未找到'开始游戏'按钮，重试 {attempt + 1}/30...")
                     time.sleep(2)
                 if not start_pos:
@@ -4240,4 +4357,10 @@ if __name__ == "__main__":
         else:
             print(f"[ERROR] 脚本异常: {e}")
     except Exception as e:
-        print(f"[ERROR] 脚本异常: {e}")
+        if STOP_FLAG:
+            print("[INFO] 已收到停止信号，脚本已停止")
+        else:
+            print(f"[ERROR] 脚本异常: {e}")
+    finally:
+        disable_system_keep_awake()
+        print("[INFO] 已恢复 Windows 默认电源管理")
