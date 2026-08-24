@@ -1943,7 +1943,7 @@ def detect_other_players_ready():
     result = cv2.matchTemplate(search_region, ready_template, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, _ = cv2.minMaxLoc(result)
 
-    if max_val >= 0.6:
+    if max_val > 0.65:
         print(f"[INFO] 检测到其他玩家已准备（置信度: {max_val:.2f}）")
         LAST_PLAYER_READY_TIME = time.time()
         return True
