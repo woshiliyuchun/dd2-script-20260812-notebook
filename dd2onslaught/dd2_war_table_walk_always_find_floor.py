@@ -1,13 +1,15 @@
 # pip install mss opencv-python pyautogui pywin32 keyboard pillow pytesseract
 #
-# DD2 自动爬塔脚本 — 完整流程：
-# 0) 每轮开始前先卖装备：按 I 打开背包 → 找背包1 → 识别 10 级装备移到背包2 → 按 Y 卖出剩余 → 关闭背包
-# 1) 从城镇出生点自动寻路到 War Table，按下 E 打开界面
-# 2) 进入 Onslaught 界面，OCR 识别 Selected Floor 当前楼层数字
-# 3) 扫描房间列表（Floor + CHAMPION SCORE 双列 OCR），找到 Floor >= 当前层数且 SCORE == 0 的房间，双击进入
-# 4) 进入房间后每 10 秒按 2/0 准备 + 随机长按方向键 1 秒，直到出现 finish game 结算界面
-# 5) 点击 To Tavern 返回城堡，等待 30 秒后开始下一轮
-# 6) 如果列表中找不到目标房间，点击 REFRESH 后每 4 秒检测一次，最多等 20 秒
+# DD2 自动爬塔脚本 — 始终按 Selected Floor 找房版本
+# 与主文件的区别：不按楼层执行chaos判断或reset；
+# 无论当前楼层是多少，每次进入房间前都先自动装备并卖装备，再按 Selected Floor 找房。
+# 1) 从城镇出生点自动寻路到 War Table，识别到 E 提示后先停在桌前
+# 2) 打开背包，点击AUTO EQUIP GEAR，再保护10级装备并出售其余装备
+# 3) 卖完后按 E 打开 War Table，进入 Onslaught 并识别 Selected Floor
+# 4) 扫描房间列表，找到 (Floor >= 当前层数或 Floor > 300) 且 SCORE == 0 的房间，双击进入
+# 5) 进入房间后每 10 秒按 2/0 准备 + 随机长按方向键 1 秒，直到出现 finish game 结算界面
+# 6) 点击 To Tavern 返回城堡，等待 30 秒后开始下一轮
+# 7) 如果列表中找不到目标房间，点击 REFRESH 后每 4 秒检测一次，最多等 20 秒
 #
 # 异常处理：
 # - 卡死检测：黑屏超 6 分钟、画面静止超 20 分钟或 Connection timed out 超 10 秒 → 自动关闭并重启游戏
@@ -2040,7 +2042,7 @@ def get_target_room_floor(hwnd, selected_floor):
     """扫描房间列表的 Floor 列和 CHAMPION SCORE 列，返回满足条件的目标房间。
     使用 ddddocr OCR + 行分割识别数字，避免 Tesseract 对游戏字体识别失败。
     房间列表有 4 列：NAME / Floor / CHAMPION SCORE / #
-    合适房间条件：Floor >= selected_floor 且 CHAMPION SCORE == 0。"""
+    合适房间条件：(Floor >= selected_floor 或 Floor > 300) 且 CHAMPION SCORE == 0。"""
     frame = capture_game_window(hwnd)
     h, w = frame.shape[:2]
 
@@ -2085,19 +2087,21 @@ def get_target_room_floor(hwnd, selected_floor):
 
     rooms.sort(key=lambda item: item[0], reverse=False)
     all_info = [(r[0], r[1]) for r in rooms]
-    print(f"[INFO] 房间列表识别结果 (Floor, CHAMPION SCORE)：{all_info}，当前需要 Floor >= {selected_floor} 且 CHAMPION SCORE == 0")
+    floor_requirement = f"Floor >= {selected_floor} 或 Floor > 300"
+    print(f"[INFO] 房间列表识别结果 (Floor, CHAMPION SCORE)：{all_info}，当前需要 ({floor_requirement}) 且 CHAMPION SCORE == 0")
 
-    # 先筛选出所有"满足条件"的房间：Floor >= selected_floor 且 (CHAMPION SCORE is None or == 0)
+    # Floor 达到当前层数，或房间 Floor 高于 300，均可作为目标房间。
     qualified_rooms = []
     for item in rooms:
         f_val, cs_val = item[0], item[1]
-        if f_val >= selected_floor and (cs_val is None or cs_val == 0):
+        floor_is_qualified = f_val >= selected_floor or f_val > 300
+        if floor_is_qualified and (cs_val is None or cs_val == 0):
             qualified_rooms.append(item)
 
     if qualified_rooms:
         # 多个合适房间时选 FLOOR 最小的那个
         qualified_rooms.sort(key=lambda item: item[0], reverse=False)
-        print(f"[INFO] 共 {len(qualified_rooms)} 个满足条件的房间 (Floor >= {selected_floor} 且 CHAMPION SCORE == 0)，FLOOR列表: {[r[0] for r in qualified_rooms]} → 选择最小FLOOR={qualified_rooms[0][0]}")
+        print(f"[INFO] 共 {len(qualified_rooms)} 个满足条件的房间 (({floor_requirement}) 且 CHAMPION SCORE == 0)，FLOOR列表: {[r[0] for r in qualified_rooms]} → 选择最小FLOOR={qualified_rooms[0][0]}")
         room = qualified_rooms[0]
         print(f"[INFO] 目标房间：Floor={room[0]}，CHAMPION SCORE={room[1]}")
         # 返回格式：(floor, left, top, width, height, conf) — left/top/width/height 是裁剪区域内坐标
@@ -2238,7 +2242,7 @@ def detect_game_failed():
 
 def detect_room_full():
     """检测房间已满画面（roomfull.png），检测到后点击 OK 按钮。
-    - 点完OK后若仍在 War Table 旁（能识别到 e-tip）：直接按E走 after_e_branch_main()（含楼层判断/chaos判断/换装等）
+    - 点完OK后若仍在 War Table 旁（能识别到 e-tip）：先卖装备，再按E找合适Floor
     - 否则走原流程：点击私人城镇按钮再重新寻路
     使用与 dd2_full.py 相同的固定参考尺寸 (1600, 900) 和客户区截取方式。"""
     if not os.path.exists(CONFIG["roomfull_template"]):
@@ -2283,7 +2287,7 @@ def detect_room_full():
                 break
             print(f"[INFO] 未找到 OK 按钮，重试 {attempt + 1}/10...")
             time.sleep(1)
-        
+
         if not ok_found:
             print("[INFO] 多次尝试未找到 OK 按钮，可能是鼠标箭头遮挡，缓慢将鼠标移到提示文字区域左上角...")
             win_left, win_top, _, _ = get_window_rect(hwnd)
@@ -2291,7 +2295,7 @@ def detect_room_full():
             text_top_left_y = win_top + top
             pyautogui.moveTo(text_top_left_x, text_top_left_y, duration=0.5)
             time.sleep(0.5)
-            
+
             for attempt in range(5):
                 frame = capture_game_window(hwnd)
                 ok_template = load_template(CONFIG["kickok_template"])
@@ -2307,7 +2311,7 @@ def detect_room_full():
                     break
                 print(f"[INFO] 移开鼠标后仍未找到 OK 按钮，重试 {attempt + 1}/5...")
                 time.sleep(1)
-        
+
         if not ok_found:
             print("[WARN] 移开鼠标后仍未找到 OK 按钮，跳过点击")
             time.sleep(2)
@@ -2330,10 +2334,7 @@ def detect_room_full():
                 break
             time.sleep(1.0)
         if etip_found:
-            print("[INFO] 仍能识别到e-tip，说明已退回到War Table旁 → 直接按E进入后续流程（含楼层<300换装等判断）")
-            humanized_press("e")
-            time.sleep(1.5)
-            # 直接走完整的按E后楼层分支总入口（包含300层判断、换装、chaos9判断、找房间等全套流程）
+            print("[INFO] 仍能识别到e-tip，说明已退回到War Table旁 → 先卖装备，再按E找合适Floor")
             after_e_branch_main()
             # after_e_branch_main() 会跑完一局后返回 True/False，处理完后这里直接 return True，
             # 让上层 run_room_progression_loop 退出，回到最外层 while 开始下一轮
@@ -3336,26 +3337,46 @@ def perform_gear_switch_and_sell():
     return True
 
 
-def perform_sell_only_no_switch():
+def perform_auto_equip_and_sell(exit_war_table=True):
     """
-    楼层≥300时的简化卖装备流程（不做autoequipgear换装）：
-    1. 按ESC退出War Table界面，1秒后按I打开背包
-    2. 直接找背包1点击 → 找10级装备移到背包2保护
-    3. 按Y卖 → Enter确认 → ESC关闭背包
+    所有楼层通用的自动装备+卖装备流程：
+    1. 如果已打开War Table则按ESC退出；随后按I打开背包
+    2. 识别并点击autoequipgear
+    3. 找背包1点击 → 找10级装备移到背包2保护
+    4. 按Y卖 → Enter确认 → ESC关闭背包
     """
-    print("[卖装备流程] 楼层≥300，执行简化卖装备流程（不换装）…")
+    print("[卖装备流程] 执行自动装备 + 卖装备流程…")
     hwnd = find_game_window()
     focus_game_window(hwnd)
-    # 1. 按ESC退出War Table界面（回到城堡）
-    print("[卖装备流程] 1/4 按 ESC 退出 War Table 界面…")
-    humanized_press("escape")
-    time.sleep(1.0)
+    # 1. 新流程识别到e-tip后尚未按E，可直接打开背包；兼容旧调用方按需先退出War Table。
+    if exit_war_table:
+        print("[卖装备流程] 1/5 按 ESC 退出 War Table 界面…")
+        humanized_press("escape")
+        time.sleep(1.0)
+    else:
+        print("[卖装备流程] 1/5 当前尚未打开 War Table，跳过 ESC…")
     # 2. 按 I 打开背包
-    print("[卖装备流程] 2/4 按 I 打开背包…")
+    print("[卖装备流程] 2/5 按 I 打开背包…")
     humanized_press("i")
     time.sleep(1.5)
-    # 3. 找背包1 → 点击 → 保护10级装备 → 按Y卖 → Enter
-    print("[卖装备流程] 3/4 执行保护 10 级装备 + 卖装备操作…")
+
+    # 3. 与主脚本换装流程一致：先点击AUTO EQUIP GEAR，再开始卖装备。
+    print("[卖装备流程] 3/5 查找 AUTO EQUIP GEAR 并点击…")
+    auto_equip_ok = False
+    for attempt in range(3):
+        if STOP_FLAG:
+            break
+        if _find_and_click_auto_equip_gear():
+            auto_equip_ok = True
+            break
+        print(f"[卖装备流程] 未找到 AUTO EQUIP GEAR，重试 {attempt + 1}/3…")
+        time.sleep(1.0)
+    if not auto_equip_ok:
+        print("[WARN] 未找到 AUTO EQUIP GEAR，继续执行后续卖装备流程")
+    time.sleep(1.5)
+
+    # 4. 找背包1 → 点击 → 保护10级装备 → 按Y卖 → Enter
+    print("[卖装备流程] 4/5 执行保护 10 级装备 + 卖装备操作…")
     moved_count = 0
     skip_positions = []
     bp1_result = _find_template_in_window(hwnd, CONFIG["backpack1_template"],
@@ -3392,11 +3413,11 @@ def perform_sell_only_no_switch():
     print("[卖装备流程] 按 Enter 确认出售…")
     humanized_press("enter")
     time.sleep(2.0)
-    # 4. 按 ESC 关闭背包
-    print("[卖装备流程] 4/4 按 ESC 关闭背包…")
+    # 5. 按 ESC 关闭背包
+    print("[卖装备流程] 5/5 按 ESC 关闭背包…")
     humanized_press("escape")
     time.sleep(2.0)
-    print("[卖装备流程] 卖装备（不换装）完成")
+    print("[卖装备流程] 自动装备与卖装备完成")
     return True
 
 
@@ -3777,12 +3798,12 @@ def _open_onslaught_and_read_floor():
 
 def _scan_rooms_and_run(selected_floor):
     """
-    基于已读取的selected_floor，扫描房间列表找floor>=selected_floor的目标房间：
+    基于已读取的selected_floor，扫描房间列表找floor>=selected_floor或floor>300的目标房间：
     找到后双击进入并执行房间流程。
     返回: True 表示打完一局成功返回；False 表示卡死/未找到
     全流程检查：超过40分钟未检测到任何玩家准备绿色对钩 → 强制卡死重启
     """
-    global STOP_FLAG, LAST_COMPLETED_FLOOR, NEED_VIEW_RESET_BEFORE_NEXT_WAR, ROOMFULL_9001_TRIGGERED, LAST_PLAYER_READY_TIME
+    global STOP_FLAG, LAST_COMPLETED_FLOOR, ROOMFULL_9001_TRIGGERED, LAST_PLAYER_READY_TIME
     while not STOP_FLAG:
         # ===== 全流程：40 分钟未检测到任何玩家准备 → 强制卡死重启 =====
         _now_scan = time.time()
@@ -3807,17 +3828,9 @@ def _scan_rooms_and_run(selected_floor):
             ok = run_room_progression_loop()
             if ok:
                 LAST_COMPLETED_FLOOR = selected_floor
-                if selected_floor > 320:
-                    print(f"[INFO] 本轮楼层={selected_floor}>320，立即执行卡死重启 + 下一次识别到War Table后执行视角专项")
-                    NEED_VIEW_RESET_BEFORE_NEXT_WAR = True
-                    if FREEZE_MONITOR:
-                        FREEZE_MONITOR.reset()
-                    recover_game()
-                    # recover_game 成功后游戏会重启，本函数返回 False 让外层重新走主循环检测 War Table
-                    return False
             return ok
         # 无目标房间，点击 REFRESH 后每 4 秒检测一次
-        print(f"[INFO] 当前房间列表无目标房间（识别到的 floor: {all_floors}，需要 >= {selected_floor}），点击 REFRESH 后每 4 秒检测")
+        print(f"[INFO] 当前房间列表无目标房间（识别到的 floor: {all_floors}，需要 >= {selected_floor} 或 > 300），点击 REFRESH 后每 4 秒检测")
         click_refresh_button()
         for i in range(5):
             time.sleep(4)
@@ -3836,15 +3849,8 @@ def _scan_rooms_and_run(selected_floor):
                 ok = run_room_progression_loop()
                 if ok:
                     LAST_COMPLETED_FLOOR = selected_floor
-                    if selected_floor > 320:
-                        print(f"[INFO] 本轮楼层={selected_floor}>320，立即执行卡死重启 + 下一次识别到War Table后执行视角专项")
-                        NEED_VIEW_RESET_BEFORE_NEXT_WAR = True
-                        if FREEZE_MONITOR:
-                            FREEZE_MONITOR.reset()
-                        recover_game()
-                        return False
                 return ok
-            print(f"[INFO] 第 {(i+1)*4} 秒检测，floor: {all_floors}，需要 >= {selected_floor}")
+            print(f"[INFO] 第 {(i+1)*4} 秒检测，floor: {all_floors}，需要 >= {selected_floor} 或 > 300")
     return False
 
 
@@ -3862,121 +3868,29 @@ def enter_onslaught_and_select_room():
 
 def after_e_branch_main():
     """
-    在 walk_to_war_table_and_press_e() 成功按E之后调用：
-    1. 进入ONSLAUGHT → BROWSE → 读取Selected Floor
-    2. 如果 SKIP_FLOOR_CHECK_THIS_ROUND=True → 直接扫描找合适房间进入（跳过楼层<300判断）
-    3. 否则：
-       - 楼层<300 → 换装卖装备 → 按E → BROWSE → defaults → chaos9/8判断
-           * chaos9 → 去右侧面板找房间
-           * gear_low → 再次ONSLAUGHT+BROWSE → 扫描找合适房间（本次SKIP楼层判断）
-       - 楼层≥300 → 直接扫描找合适房间进入
+    在 walk_to_war_table_and_detect_e_tip() 识别到E提示但尚未按E时调用：
+    1. 所有楼层统一执行自动装备+卖装备流程
+    2. 关闭背包后直接按E → ONSLAUGHT → BROWSE → 读取Selected Floor
+    3. 直接扫描并进入 Floor >= Selected Floor 或 Floor > 300 的合适房间
     返回：打完房间成功返回True；中途失败/卡死返回False
     """
-    global SKIP_FLOOR_CHECK_THIS_ROUND, LAST_COMPLETED_FLOOR, NEED_RESET_AFTER_ROUND, NEED_VIEW_RESET_BEFORE_NEXT_WAR
-    # 重置本次标记：每次重新按E进入流程后，如果之前是gear_low过来的，会在最外层被设置为True，这里直接读取即可
-    # 1. 进入 ONSLAUGHT 并读取楼层
+    print("[分支入口] 每次进入房间前先执行自动装备 + 卖装备流程…")
+    perform_auto_equip_and_sell(exit_war_table=False)
+    if STOP_FLAG:
+        return False
+
+    # 卖装备期间角色没有移动，关闭背包后仍在e-tip位置，直接按E。
+    print("[分支入口] 卖装备完成，直接按E打开War Table…")
+    humanized_press("e")
+    time.sleep(0.8)
+
     print("[分支入口] 进入 ONSLAUGHT 并读取 Selected Floor…")
     selected_floor = _open_onslaught_and_read_floor()
     if selected_floor is None:
         return False
     print(f"[分支入口] 当前 Selected Floor = {selected_floor}")
-
-    # 2. 判断是否需要跳过楼层<300判断（来自gear_low的前序流程）
-    if SKIP_FLOOR_CHECK_THIS_ROUND:
-        print("[分支入口] SKIP_FLOOR_CHECK_THIS_ROUND=True，跳过楼层<300判断，直接找合适房间")
-        SKIP_FLOOR_CHECK_THIS_ROUND = False
-        ok = _scan_rooms_and_run(selected_floor)
-        return ok
-
-    # 3. 正常楼层判断分支
-    if selected_floor < 300:
-        print(f"[分支入口] 楼层 {selected_floor}<300，进入换装+卖装备流程…")
-        # 3a. ESC → 按I → 找autoequipgear → 卖装备 → 关背包
-        perform_gear_switch_and_sell()
-        # 3b. 按E → 找BROWSE → 点击defaults → 等2秒 → 判断chaos9/8
-        judge_result, defaults_center = enter_browse_defaults_and_judge_chaos()
-        if judge_result == "chaos9":
-            print("[分支入口] chaos9分支 → 进入右侧面板寻找房间…")
-            ok = enter_right_panel_room_and_run(defaults_center)
-            if ok:
-                LAST_COMPLETED_FLOOR = selected_floor
-                if selected_floor > 320:
-                    print(f"[INFO] 本轮(chaos9右侧)楼层={selected_floor}>320，立即执行卡死重启 + 下一次识别到War Table后执行视角专项")
-                    NEED_VIEW_RESET_BEFORE_NEXT_WAR = True
-                    if FREEZE_MONITOR:
-                        FREEZE_MONITOR.reset()
-                    recover_game()
-                    return False
-            return ok
-        else:
-            # gear_low → 走楼层流程：切回 ONSLAUGHT 找合适房间刷分，
-            # 打完后下一轮回来会重新换装备 + 检测 gear 分，直到能识别到 chaos9/10/11 才走右侧chaos房间路径
-            print("[分支入口] gear_low分支 → 切回 ONSLAUGHT 找合适房间刷分（打完后再回来检测 gear 分）…")
-            sf2 = _open_onslaught_and_read_floor()
-            if sf2 is None:
-                print("[WARN] gear_low后重试读取楼层失败，终止流程")
-                return False
-            if sf2 > 320:
-                print(f"[分支入口] gear_low重入后读取 Selected Floor = {sf2}>320，立即执行卡死重启 + 下一次识别到War Table后执行视角专项")
-                NEED_VIEW_RESET_BEFORE_NEXT_WAR = True
-                LAST_COMPLETED_FLOOR = sf2
-                if FREEZE_MONITOR:
-                    FREEZE_MONITOR.reset()
-                recover_game()
-                return False
-            print(f"[分支入口] gear_low重入后读取 Selected Floor = {sf2}")
-            ok = _scan_rooms_and_run(sf2)
-            return ok
-    else:
-        # 楼层 >= 300 分两种情况：
-        #   300~320：还没到 Ancient Power 门槛，继续简化卖装备（不换装）→ 找合适楼层房间推进
-        #   > 320：才走卡死重启 + 下一次识别到 War Table 后执行视角专项（reset）
-        if selected_floor <= 320:
-            print(f"[分支入口] 楼层 {selected_floor} 在 300~320 之间，继续简化卖装备（不换装）→ 找合适楼层房间推进")
-            # 1. 简化卖装备（ESC→按I→找背包1点击→保护10级→按Y卖→ESC关背包）
-            perform_sell_only_no_switch()
-            # 2. 卖完装备后，当前还在城堡，按E回到War Table交互界面
-            print("[分支入口] 卖装备完成，回到War Table旁识别e-tip并按E…")
-            hwnd = find_game_window()
-            etip_ok = False
-            for _a in range(10):
-                if STOP_FLAG:
-                    break
-                if detect_e_tip(hwnd) is not None:
-                    humanized_press("e")
-                    time.sleep(0.8)
-                    etip_ok = True
-                    break
-                # 没识别到，按一下W微调位置
-                humanized_press("w")
-                time.sleep(0.3)
-            if not etip_ok:
-                print("[WARN] 卖装备后按E失败，尝试直接走ONSLAUGHT流程…")
-            # 3. 重新走ONSLAUGHT→BROWSE→读Selected Floor，然后找合适房间
-            sf_new = _open_onslaught_and_read_floor()
-            if sf_new is None:
-                print("[WARN] 卖装备后重新读取楼层失败，终止流程")
-                return False
-            if sf_new > 320:
-                print(f"[分支入口] 卖装备后读取 Selected Floor = {sf_new}>320，立即执行卡死重启 + 下一次识别到War Table后执行视角专项")
-                NEED_VIEW_RESET_BEFORE_NEXT_WAR = True
-                LAST_COMPLETED_FLOOR = sf_new
-                if FREEZE_MONITOR:
-                    FREEZE_MONITOR.reset()
-                recover_game()
-                return False
-            print(f"[分支入口] 卖装备后读取 Selected Floor = {sf_new}，开始找合适房间")
-            ok = _scan_rooms_and_run(sf_new)
-            return ok
-        else:
-            # 楼层 > 320，直接卡死重启 + 下一次识别到 War Table 后执行视角专项（reset）
-            print(f"[分支入口] 楼层 {selected_floor}>320，直接执行卡死重启 + 视角专项（reset）流程")
-            NEED_VIEW_RESET_BEFORE_NEXT_WAR = True
-            LAST_COMPLETED_FLOOR = selected_floor
-            if FREEZE_MONITOR:
-                FREEZE_MONITOR.reset()
-            recover_game()
-            return False
+    print("[分支入口] 不判断楼层范围，开始查找合适 Floor")
+    return _scan_rooms_and_run(selected_floor)
 
 
 # ========================= 自动寻路主逻辑 =========================
@@ -4093,13 +4007,13 @@ def center_alignment(target_x, target_y, frame_w, frame_h):
     return "approach"
 
 
-def walk_to_war_table_and_press_e():
+def walk_to_war_table_and_detect_e_tip():
     """
     核心主逻辑：
     1) 若 NEED_VIEW_RESET_BEFORE_NEXT_WAR=True，先识别 War Table 并执行视角重置专项；
     2) 先朝前走 4 步接近 War Table，停顿 2 秒让画面稳定后识别 E 提示；
     3) 若未识别到 E，每走 1 步停顿一下再识别，直到识别出来为止；
-    4) 识别到 E 后按 E 交互；
+    4) 识别到 E 后不按键，交给卖装备流程处理，卖完后再按 E；
     5) F12 可立即中止所有键鼠动作。
     """
     global STOP_FLAG, NEED_VIEW_RESET_BEFORE_NEXT_WAR
@@ -4142,8 +4056,7 @@ def walk_to_war_table_and_press_e():
     hwnd = find_game_window()
     e_pos = detect_e_tip(hwnd)
     if e_pos is not None:
-        print("[INFO] 检测到 E 提示，准备按 E 交互")
-        press_e_interact()
+        print("[INFO] 检测到 E 提示，暂不按 E，先进入卖装备流程")
         return True
 
     # 3) 未识别到 E，每走 1 步停顿一下再识别，直到识别出来为止
@@ -4167,8 +4080,7 @@ def walk_to_war_table_and_press_e():
         hwnd = find_game_window()
         e_pos = detect_e_tip(hwnd)
         if e_pos is not None:
-            print(f"[INFO] 走 {walk_step_count} 步后检测到 E 提示，准备按 E 交互")
-            press_e_interact()
+            print(f"[INFO] 走 {walk_step_count} 步后检测到 E 提示，暂不按 E，先进入卖装备流程")
             return True
 
     if walk_step_count >= max_walk_steps:
@@ -4189,7 +4101,7 @@ if __name__ == "__main__":
     enable_system_keep_awake()
 
     print("=" * 70)
-    print("DD2 自动寻路到 War Table 并按 E 打开界面")
+    print("DD2 自动寻路到 War Table（始终按 Selected Floor 找房版）")
     print("=" * 70)
     print("说明：")
     print("- 走路阶段：无系统鼠标光标，主要使用 W 慢走，必要时轻微 A/D 横移校正")
@@ -4407,15 +4319,15 @@ if __name__ == "__main__":
                 time.sleep(10)
                 continue
 
-            # 不再在寻路前卖装备：改为 War Table 之后、读取 Selected Floor 之后按楼层判断再决定
-            if walk_to_war_table_and_press_e():
+            # 识别到e-tip后先卖装备，卖完再按E并按Selected Floor找房
+            if walk_to_war_table_and_detect_e_tip():
                 # 寻路完成后做一次卡死检测
                 if check_and_recover_if_frozen(FREEZE_MONITOR):
                     print("[INFO] 游戏已从卡死恢复，等待 10 秒后重新开始")
                     time.sleep(10)
                     continue
 
-                # 按E后走楼层分支入口（内部处理楼层<300换装、≥300直接onslaught、chaos9右面板、gear_low跳过等）
+                # 按E后先卖装备，再按Selected Floor找合适房间
                 after_e_branch_main()
 
                 # 点击 To Tavern 返回城堡后，每隔10秒检测 War Table
@@ -4598,16 +4510,15 @@ if __name__ == "__main__":
                     time.sleep(10)
                     continue
 
-                # 不再在寻路前卖装备：改为按E后走楼层分支入口
-                if walk_to_war_table_and_press_e():
+                # 识别到e-tip后先卖装备，卖完再按E并按Selected Floor找房
+                if walk_to_war_table_and_detect_e_tip():
                     if check_and_recover_if_frozen(FREEZE_MONITOR):
                         print("[INFO] 游戏已从卡死恢复，等待 10 秒后重新开始")
                         time.sleep(10)
                         continue
-                    # 走楼层分支入口（内部处理换装、chaos判断、右侧面板/onslaught等）
+                    # 按E后先卖装备，再按Selected Floor找合适房间
                     after_e_branch_main()
-                    # after_e_branch_main 内部已经处理了卡死+reset视角的流程，
-                    # 返回后游戏已在城堡界面（recover_game 中 detect_war_table 已识别到），无需再等 60 秒
+                    # 房间流程返回后继续下一轮寻路；真正的卡死恢复仍由各监控点处理
                     print("[INFO] 已返回城堡，立即开始下一轮寻路")
                 time.sleep(1.0)
         else:
