@@ -1,16 +1,22 @@
 import os
+import sys
 import time
 import random
+import threading
+from pathlib import Path
 import win32api
 import win32con
 import win32gui
-import win32ui
 import pyautogui
 import cv2
 import numpy as np
-import ctypes
-import mss
 from PIL import Image
+
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+from dd2onslaught import dd2_war_table_walk as war_table
 
 GAME_CLASS = "LaunchUnrealUWindowsClient"
 GAME_TITLE = "Dungeon Defenders 2"
@@ -28,12 +34,90 @@ REGION_CONFIG = {
     '失败重来区域': (0.48, 0.77, 0.5, 0.8),
 }
 
-SCRIPT_DIR = r"D:\DD2脚本"
-TEMPLATE_BACKPACK1 = os.path.join(SCRIPT_DIR, "背包1.png")
-TEMPLATE_BACKPACK2 = os.path.join(SCRIPT_DIR, "背包2.png")
-TEMPLATE_LEVEL10 = os.path.join(SCRIPT_DIR, "10级装备.png")
+SCRIPT_DIR = str(PROJECT_DIR)
+WEST_BUILD_DIR = Path(__file__).resolve().parent
+TEMPLATE_EXTRA_REWARD = os.path.join(SCRIPT_DIR, "额外奖励.png")
+TEMPLATE_REPLAY = os.path.join(SCRIPT_DIR, "replay.png")
+TEMPLATE_FAILURE_RETRY = os.path.join(SCRIPT_DIR, "失败重来.png")
+TEMPLATE_WILD_WEST = str(WEST_BUILD_DIR / "picture" / "wildwest.png")
+TEMPLATE_WILD_WEST_STAGE = str(WEST_BUILD_DIR / "picture" / "wildwest-1.png")
+TEMPLATE_CHAOS1_BEGIN = str(WEST_BUILD_DIR / "picture" / "chaos1_begin.png")
+TEMPLATE_BROWSE = str(PROJECT_DIR / "dd2onslaught" / "picture" / "BROWSE.png")
+TEMPLATE_CREATE = str(WEST_BUILD_DIR / "picture" / "create.png")
+TEMPLATE_PRIVATE_GAME = str(WEST_BUILD_DIR / "picture" / "privitegame.png")
+TEMPLATE_GO_BEGIN = str(WEST_BUILD_DIR / "picture" / "go_begin.png")
+TEMPLATE_CORE = str(WEST_BUILD_DIR / "picture" / "core.png")
+TEMPLATE_CONNECTION_FAILED = str(PROJECT_DIR / "DD2ganmedie" / "connectionfailed.png")
 TEMPLATE_CACHE = {}
-MATCH_THRESHOLD = 0.6
+MAP_MATCH_THRESHOLD = 0.7
+CONNECTION_FAILED_THRESHOLD = 0.9
+NETWORK_CHECK_INTERVAL_SECONDS = 60.0
+NO_SETTLEMENT_TIMEOUT_SECONDS = 30.0 * 60.0
+
+CAPTURE_LOCK = threading.RLock()
+RECOVERY_REQUEST = threading.Event()
+WINDOW_GUARD_ACTIVE = threading.Event()
+SETTLEMENT_WATCH_ACTIVE = threading.Event()
+WATCHDOG_STOP = threading.Event()
+STATE_LOCK = threading.Lock()
+LAST_SETTLEMENT_TIME = None
+RECOVERY_REASON = None
+
+
+class RecoveryRequested(RuntimeError):
+    """Raised in the foreground flow when the watchdog requests a restart."""
+
+
+def request_recovery(reason):
+    global RECOVERY_REASON
+    with STATE_LOCK:
+        if RECOVERY_REQUEST.is_set():
+            return
+        RECOVERY_REASON = reason
+        RECOVERY_REQUEST.set()
+    print(f"[卡死检测] {reason}，准备执行卡死恢复流程")
+
+
+def clear_recovery_request():
+    global RECOVERY_REASON
+    with STATE_LOCK:
+        RECOVERY_REASON = None
+        RECOVERY_REQUEST.clear()
+
+
+def raise_if_recovery_requested():
+    if RECOVERY_REQUEST.is_set():
+        with STATE_LOCK:
+            reason = RECOVERY_REASON or "收到卡死恢复请求"
+        raise RecoveryRequested(reason)
+
+
+def mark_settlement_seen(source):
+    global LAST_SETTLEMENT_TIME
+    with STATE_LOCK:
+        LAST_SETTLEMENT_TIME = time.monotonic()
+    print(f"[卡死检测] 已识别结算画面（{source}），重置30分钟计时")
+
+
+def start_settlement_watch():
+    global LAST_SETTLEMENT_TIME
+    with STATE_LOCK:
+        LAST_SETTLEMENT_TIME = time.monotonic()
+    SETTLEMENT_WATCH_ACTIVE.set()
+
+
+def stop_settlement_watch():
+    SETTLEMENT_WATCH_ACTIVE.clear()
+
+
+def seconds_since_last_settlement(now=None):
+    if now is None:
+        now = time.monotonic()
+    with STATE_LOCK:
+        last_seen = LAST_SETTLEMENT_TIME
+    if last_seen is None:
+        return 0.0
+    return max(0.0, now - last_seen)
 
 
 def get_window_rect(hwnd):
@@ -57,24 +141,8 @@ def get_client_rect_for_recognition(hwnd):
 
 
 def capture_client_region(hwnd, left, top, width, height):
-    hdc_window = win32gui.GetDC(hwnd)
-    hdc_mem = win32gui.CreateCompatibleDC(hdc_window)
-    hbmp = win32gui.CreateCompatibleBitmap(hdc_window, width, height)
-    old_bmp = win32gui.SelectObject(hdc_mem, hbmp)
-    
-    win32gui.BitBlt(hdc_mem, 0, 0, width, height, hdc_window, left, top, win32con.SRCCOPY)
-    
-    hbmp_obj = win32ui.CreateBitmapFromHandle(hbmp)
-    bmp_str = hbmp_obj.GetBitmapBits(True)
-    img = np.frombuffer(bmp_str, dtype=np.uint8).reshape((height, width, 4))
-    img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-    
-    win32gui.SelectObject(hdc_mem, old_bmp)
-    win32gui.DeleteObject(hbmp)
-    win32gui.DeleteDC(hdc_mem)
-    win32gui.ReleaseDC(hwnd, hdc_window)
-    
-    return img
+    with CAPTURE_LOCK:
+        return war_table.capture_client_region(hwnd, left, top, width, height)
 
 
 def client_to_screen(hwnd, x, y):
@@ -88,14 +156,14 @@ def relative_to_screen(hwnd, rel_x, rel_y):
     w, h = get_client_rect(hwnd)
     client_x = int(rel_x * w)
     client_y = int(rel_y * h)
-    
+
     try:
         win_left, win_top, win_right, win_bottom = win32gui.GetWindowRect(hwnd)
         client_rect = win32gui.GetClientRect(hwnd)
-        
+
         frame_left = (win_right - win_left) - client_rect[2]
         frame_top = (win_bottom - win_top) - client_rect[3]
-        
+
         screen_x = win_left + frame_left + client_x
         screen_y = win_top + frame_top + client_y
         return (screen_x, screen_y)
@@ -104,6 +172,7 @@ def relative_to_screen(hwnd, rel_x, rel_y):
 
 
 def key_down(key):
+    raise_if_recovery_requested()
     if isinstance(key, str):
         if key.upper() == 'SPACE':
             vk = win32con.VK_SPACE
@@ -151,6 +220,25 @@ def key_up(key):
     win32api.keybd_event(vk, win32api.MapVirtualKey(vk, 0), win32con.KEYEVENTF_KEYUP, 0)
 
 
+def release_all_inputs():
+    """Release any key or mouse button that a recovery interrupted."""
+    keys = (
+        "W", "A", "S", "D", "P", "L", "I", "Y", "E", "Q", "N",
+        "0", "5", "6", "7", "8", "F1", "F2", "F4",
+        "SHIFT", "CTRL", "CAPSLOCK", "SPACE", "ENTER", "ESC",
+    )
+    for key in keys:
+        try:
+            key_up(key)
+        except Exception:
+            pass
+    for button in ("left", "right"):
+        try:
+            pyautogui.mouseUp(button=button)
+        except Exception:
+            pass
+
+
 
 # ========================= 反作弊人性化输入工具 =========================
 # 所有键鼠操作加入随机扰动，模拟真人操作节奏，避免固定周期被检测
@@ -176,7 +264,10 @@ def humanized_sleep(base_seconds):
         return
     jitter = base_seconds * random.uniform(-0.2, 0.2)
     actual = max(0.05, base_seconds + jitter)
-    time.sleep(actual)
+    deadline = time.monotonic() + actual
+    while time.monotonic() < deadline:
+        raise_if_recovery_requested()
+        time.sleep(min(0.5, deadline - time.monotonic()))
 
 
 def load_image(image_path):
@@ -204,7 +295,7 @@ def locate_image(hwnd, image_path, region_name, confidence=0.7):
 
         cw, ch = get_client_rect_for_recognition(hwnd)
         print(f"📌 当前客户区尺寸: {cw}x{ch}")
-        
+
         left = int(region[0] * cw)
         top = int(region[1] * ch)
         right = int(region[2] * cw)
@@ -247,11 +338,11 @@ def build_western_festival():
     time.sleep(1188 / 1000.0)
     key_down("0"); time.sleep(89 / 1000.0); key_up("0")
     time.sleep(1597 / 1000.0)
-    key_down("W"); time.sleep(450 / 1000.0); key_up("W")
+    key_down("W"); time.sleep(480 / 1000.0); key_up("W")
     time.sleep(270 / 1000.0)
     key_down("Space"); time.sleep(103 / 1000.0); key_up("Space")
     time.sleep(633 / 1000.0)
-    key_down("W"); time.sleep(75 / 1000.0); key_up("W")
+    key_down("W"); time.sleep(85 / 1000.0); key_up("W")
     time.sleep(575 / 1000.0)
     key_down("W"); time.sleep(105 / 1000.0); key_up("W")
     time.sleep(1488 / 1000.0)
@@ -836,19 +927,13 @@ def build_western_festival():
     pyautogui.mouseUp(); time.sleep(2 / 1000.0)
     key_up("D"); time.sleep(2830 / 1000.0)
     key_down("F4"); time.sleep(152 / 1000.0); key_up("F4")
-    time.sleep(2079 / 1000.0)
 
     print("✅ 建造西方节日完成")
 
 
 def capture_game_window(hwnd):
-    x, y, width, height = get_window_rect(hwnd)
-    if width <= 0 or height <= 0:
-        raise RuntimeError("游戏窗口尺寸无效")
-    with mss.mss() as sct:
-        monitor = {"left": x, "top": y, "width": width, "height": height}
-        img = np.array(sct.grab(monitor))
-    return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+    with CAPTURE_LOCK:
+        return war_table.capture_game_window(hwnd)
 
 
 def load_template_cached(template_path):
@@ -862,327 +947,594 @@ def load_template_cached(template_path):
     return img
 
 
-def find_template_in_region(frame_bgr, template_bgr, region=None, threshold=None, skip_positions=None, skip_radius=30):
-    if threshold is None:
-        threshold = MATCH_THRESHOLD
-    if region is not None:
-        rx0, ry0, rx1, ry1 = region
-        search_frame = frame_bgr[ry0:ry1, rx0:rx1]
-    else:
-        search_frame = frame_bgr
-        rx0, ry0 = 0, 0
-    result = cv2.matchTemplate(search_frame, template_bgr, cv2.TM_CCOEFF_NORMED)
-    th, tw = template_bgr.shape[:2]
-    if skip_positions:
-        for (sx, sy) in skip_positions:
-            local_x = sx - rx0
-            local_y = sy - ry0
-            mask_x0 = max(0, local_x - skip_radius)
-            mask_y0 = max(0, local_y - skip_radius)
-            mask_x1 = min(result.shape[1], local_x + skip_radius)
-            mask_y1 = min(result.shape[0], local_y + skip_radius)
-            result[mask_y0:mask_y1, mask_x0:mask_x1] = -1.0
-    _, max_val, _, max_loc = cv2.minMaxLoc(result)
-    if max_val < threshold:
-        return None
-    center_x = max_loc[0] + tw // 2 + rx0
-    center_y = max_loc[1] + th // 2 + ry0
-    return center_x, center_y, max_val
+def interruptible_sleep(seconds):
+    """Sleep in short slices so recovery requests are handled promptly."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        raise_if_recovery_requested()
+        time.sleep(min(0.5, deadline - time.monotonic()))
 
 
-def find_template_on_screen(hwnd, template_path, threshold=None):
+def find_game_window_or_none():
+    hwnd = win32gui.FindWindow(GAME_CLASS, GAME_TITLE)
+    return hwnd or None
+
+
+def focus_game_window(hwnd):
+    if not hwnd or not win32gui.IsWindow(hwnd):
+        raise RecoveryRequested("DD2游戏窗口已经消失")
+    war_table.focus_game_window(hwnd)
+    return hwnd
+
+
+def find_template_match(hwnd, template_path, threshold=MAP_MATCH_THRESHOLD,
+                        right_half=False):
+    """Find a template in the game window and return screen/frame coordinates."""
     frame = capture_game_window(hwnd)
+    frame_h, frame_w = frame.shape[:2]
+    offset_x = frame_w // 2 if right_half else 0
+    search_frame = frame[:, offset_x:] if right_half else frame
     template = load_template_cached(template_path)
+    rect = war_table.find_template_rect(
+        search_frame,
+        template,
+        threshold=threshold,
+    )
+    if rect is None:
+        return None
+
+    frame_x = rect["center_x"] + offset_x
+    frame_y = rect["center_y"]
     win_left, win_top, _, _ = get_window_rect(hwnd)
-    result = find_template_in_region(frame, template, threshold=threshold)
-    if result is None:
-        return None
-    cx, cy, conf = result
-    return win_left + cx, win_top + cy, conf
+    return {
+        "screen_x": win_left + frame_x,
+        "screen_y": win_top + frame_y,
+        "frame_x": frame_x,
+        "frame_y": frame_y,
+        "frame_width": frame_w,
+        "frame_height": frame_h,
+        "confidence": rect["max_val"],
+    }
 
 
-def find_template_in_backpack(hwnd, template_path, threshold=None, skip_positions=None):
-    frame = capture_game_window(hwnd)
-    h, w = frame.shape[:2]
-    template = load_template_cached(template_path)
-    x0 = int(w * 0.50)
-    y0 = int(h * 0.15)
-    x1 = int(w * 0.95)
-    y1 = int(h * 0.90)
-    win_left, win_top, _, _ = get_window_rect(hwnd)
-    frame_skip = None
-    if skip_positions:
-        frame_skip = [(sx - win_left, sy - win_top) for (sx, sy) in skip_positions]
-    result = find_template_in_region(frame, template, region=(x0, y0, x1, y1), threshold=threshold, skip_positions=frame_skip)
-    if result is None:
-        return None
-    cx, cy, conf = result
-    return win_left + cx, win_top + cy, conf
+def wait_for_template(hwnd, template_path, label, timeout_seconds,
+                      threshold=MAP_MATCH_THRESHOLD, right_half=False,
+                      retry_seconds=1.0):
+    deadline = time.monotonic() + timeout_seconds
+    attempt = 0
+    while time.monotonic() < deadline:
+        raise_if_recovery_requested()
+        if not find_game_window_or_none():
+            raise RecoveryRequested(f"等待{label}时DD2游戏窗口消失")
+        attempt += 1
+        match = find_template_match(
+            hwnd,
+            template_path,
+            threshold=threshold,
+            right_half=right_half,
+        )
+        if match is not None:
+            print(
+                f"[选图] 找到{label}，置信度={match['confidence']:.3f}，"
+                f"坐标=({match['screen_x']}, {match['screen_y']})"
+            )
+            return match
+        if attempt == 1 or attempt % 10 == 0:
+            elapsed = timeout_seconds - max(0.0, deadline - time.monotonic())
+            print(f"[选图] 尚未找到{label}，已等待 {elapsed:.0f} 秒")
+        interruptible_sleep(retry_seconds)
+    return None
 
 
-def click_backpack1(hwnd):
-    result = find_template_on_screen(hwnd, TEMPLATE_BACKPACK1)
-    if result is None:
-        print("[WARN] 未找到背包1按钮图像")
-        return False
-    sx, sy, conf = result
-    print(f"[INFO] 找到背包1，屏幕坐标=({sx}, {sy})，置信度={conf:.3f}")
-    humanized_move_to(sx, sy)
-    time.sleep(random.uniform(0.05, 0.15))
-    pyautogui.click()
-    time.sleep(random.uniform(0.8, 1.2))
-    return True
+def click_match(match, clicks=1):
+    humanized_move_to(match["screen_x"], match["screen_y"])
+    time.sleep(random.uniform(0.1, 0.25))
+    pyautogui.click(clicks=clicks, interval=0.2)
 
 
-def find_backpack2(hwnd):
-    result = find_template_on_screen(hwnd, TEMPLATE_BACKPACK2)
-    if result is None:
-        result = find_template_on_screen(hwnd, TEMPLATE_BACKPACK2, threshold=0.4)
-    if result is None:
-        print("[WARN] 未找到背包2按钮图像")
-        return None
-    sx, sy, conf = result
-    print(f"[INFO] 找到背包2，屏幕坐标=({sx}, {sy})，置信度={conf:.3f}")
-    return sx, sy
+def walk_to_war_table_without_open(hwnd):
+    """Reach the War Table and stop when E-tip is visible, without pressing E."""
+    print("[寻路] 开始识别 War Table，并移动到 E-tip 可见的位置")
+    focus_game_window(hwnd)
+    deadline = time.monotonic() + 180.0
+    scan_round = 0
 
+    while time.monotonic() < deadline:
+        raise_if_recovery_requested()
+        if not find_game_window_or_none():
+            raise RecoveryRequested("寻找War Table时游戏窗口消失")
 
-def find_level10_equipment(hwnd, skip_positions=None):
-    key_down("SHIFT")
-    time.sleep(random.uniform(0.8, 1.2))
-    result = find_template_in_backpack(hwnd, TEMPLATE_LEVEL10, threshold=0.5, skip_positions=skip_positions)
-    if result is not None:
-        sx, sy, conf = result
-        print(f"[INFO] 找到 10 级装备！屏幕坐标=({sx}, {sy})，置信度={conf:.3f}")
-    else:
-        print("[INFO] 未找到 10 级装备")
-    key_up("SHIFT")
-    time.sleep(random.uniform(0.4, 0.6))
-    return result
+        table = war_table.detect_war_table(hwnd)
+        if table is not None:
+            print(
+                f"[寻路] 找到 War Table，置信度={table[2]:.3f}，"
+                "先连续按 4 次 W 靠近"
+            )
+            for _ in range(4):
+                raise_if_recovery_requested()
+                war_table.move_forward_once()
+                interruptible_sleep(0.4)
 
+            print("[寻路] 4 次 W 完成，停顿 0.5 秒后识别 E-tip")
+            interruptible_sleep(0.5)
+            e_tip = war_table.detect_e_tip(hwnd)
+            if e_tip is not None:
+                print(
+                    f"[寻路] 已识别 E-tip，置信度={e_tip[2]:.3f}；"
+                    "已到达 War Table 交互位置"
+                )
+                return True
 
-def move_level10_to_backpack2(hwnd, equip_sx, equip_sy):
-    humanized_move_to(equip_sx, equip_sy)
-    time.sleep(random.uniform(0.8, 1.2))
-    print("[INFO] 按 L 锁住装备")
-    humanized_press("L")
-    time.sleep(random.uniform(0.8, 1.2))
-    print("[INFO] 左键点击装备（拿起）")
-    pyautogui.click(button="left")
-    time.sleep(random.uniform(1.2, 1.8))
-    bp2_pos = find_backpack2(hwnd)
-    if bp2_pos is None:
-        print("[INFO] 等待1秒后重试查找背包2...")
-        time.sleep(1.0)
-        bp2_pos = find_backpack2(hwnd)
-    if bp2_pos is None:
-        print("[WARN] 未找到背包2")
-        return False
-    bp2_sx, bp2_sy = bp2_pos
-    humanized_move_to(bp2_sx, bp2_sy)
-    time.sleep(random.uniform(0.8, 1.2))
-    print("[INFO] 右键点击背包2（放入装备）")
-    pyautogui.click(button="right")
-    time.sleep(random.uniform(0.8, 1.2))
-    win_rect = get_window_rect(hwnd)
-    safe_x = win_rect[0] + win_rect[2] // 4
-    safe_y = win_rect[1] + win_rect[3] // 4
-    humanized_move_to(safe_x, safe_y)
-    time.sleep(random.uniform(0.8, 1.2))
-    return True
+            print("[寻路] 尚未识别到 E-tip，改为每前进 1 次识别一次")
+            for walk_step in range(1, 11):
+                raise_if_recovery_requested()
+                if not find_game_window_or_none():
+                    raise RecoveryRequested("寻找E-tip时游戏窗口消失")
+                war_table.move_forward_once()
+                interruptible_sleep(0.5)
+                e_tip = war_table.detect_e_tip(hwnd)
+                if e_tip is not None:
+                    print(
+                        f"[寻路] 继续前进 {walk_step} 次后识别到 E-tip，"
+                        f"置信度={e_tip[2]:.3f}"
+                    )
+                    return True
+            raise RecoveryRequested("连续前进10次仍未识别到E-tip")
 
-
-def sell_all_equipment(hwnd):
-    print("[INFO] 按 Y 批量出售装备...")
-    humanized_press("Y")
-    time.sleep(random.uniform(1.6, 2.4))
-    print("[INFO] 按 ENTER 确认出售...")
-    humanized_press("ENTER")
-    time.sleep(random.uniform(1.6, 2.4))
-
-
-def sell_equipment(hwnd):
-    print("💰 开始卖装备环节（含10级装备保护）...")
-
-    for name, path in [("背包1", TEMPLATE_BACKPACK1), ("背包2", TEMPLATE_BACKPACK2),
-                        ("10级装备", TEMPLATE_LEVEL10)]:
-        if not os.path.exists(path):
-            print(f"[ERROR] 缺少模板文件：{name} = {path}")
-            return
-
-    print("1. 按 I 打开背包...")
-    humanized_press("I")
-    time.sleep(3.0)
-
-    print("2. 图像识别并点击背包1...")
-    if not click_backpack1(hwnd):
-        print("[ERROR] 无法找到背包1，终止")
-        return
-    time.sleep(2.0)
-
-    print("3. 循环检查10级装备并移到背包2...")
-    moved_count = 0
-    max_rounds = 20
-    skip_positions = []
-
-    for round_idx in range(max_rounds):
-        print(f"--- 第 {round_idx + 1} 轮检查 ---")
-        equip_result = find_level10_equipment(hwnd, skip_positions=skip_positions)
-        if equip_result is None:
-            print("[INFO] 没有更多10级装备，进入出售流程")
-            break
-
-        equip_sx, equip_sy, _ = equip_result
-        success = move_level10_to_backpack2(hwnd, equip_sx, equip_sy)
-        if success:
-            moved_count += 1
-            skip_positions.append((equip_sx, equip_sy))
-            print(f"[INFO] 已移动第 {moved_count} 件10级装备到背包2")
+        scan_round += 1
+        print(f"[寻路] 未找到 War Table，第 {scan_round} 次扫描")
+        if scan_round % 2:
+            war_table.left_scan_once()
         else:
-            print("[WARN] 移动失败，跳过本轮")
-        time.sleep(1.0)
+            war_table.right_scan_once()
+        if scan_round >= 6:
+            war_table.move_forward_once()
+            scan_round = 0
 
-    print(f"共移动 {moved_count} 件10级装备到背包2")
+        interruptible_sleep(0.3)
 
-    print("4. 出售剩余装备...")
-    sell_all_equipment(hwnd)
+    raise RecoveryRequested("180秒内未能走到War Table的E-tip位置")
 
-    print("5. 按 ESC 关闭背包...")
-    humanized_press("ESC")
-    time.sleep(random.uniform(1.6, 2.4))
 
-    print(f"✅ 卖装备完成，共保护 {moved_count} 件10级装备")
+def select_wild_west_map(hwnd):
+    """Open the War Table and create a Chaos 1 Wild West game."""
+    print("[选图] War Table 前置流程完成，按 E 打开 War Table")
+    humanized_press("E")
+    interruptible_sleep(random.uniform(2.0, 3.0))
+    print("[选图] 按 Q 打开地图选择")
+    humanized_press("Q")
+    interruptible_sleep(random.uniform(2.0, 3.0))
+    print("[选图] 按 E 确认进入地图列表")
+    humanized_press("E")
+    interruptible_sleep(2.0)
+
+    wild_west = wait_for_template(
+        hwnd, TEMPLATE_WILD_WEST, "wildwest", 60.0
+    )
+    if wild_west is None:
+        raise RecoveryRequested("60秒内未找到wildwest")
+    click_match(wild_west)
+    interruptible_sleep(2.0)
+
+    stage = wait_for_template(
+        hwnd, TEMPLATE_WILD_WEST_STAGE, "wildwest-1", 60.0
+    )
+    if stage is None:
+        raise RecoveryRequested("60秒内未找到wildwest-1")
+    stage["screen_y"] -= int(stage["frame_height"] * 0.03)
+    print("[选图] 点击 wildwest-1 正上方游戏高度3%的位置")
+    click_match(stage)
+    interruptible_sleep(2.0)
+
+    chaos1 = wait_for_template(
+        hwnd,
+        TEMPLATE_CHAOS1_BEGIN,
+        "chaos1_begin",
+        60.0,
+        right_half=True,
+    )
+    if chaos1 is None:
+        raise RecoveryRequested("60秒内未在游戏右半侧找到chaos1_begin")
+    chaos1["screen_x"] += int(chaos1["frame_width"] * 0.065)
+    print("[选图] 点击 chaos1_begin 右侧游戏宽度6.5%的位置，共7次，每次间隔1-2秒")
+    for click_index in range(7):
+        click_match(chaos1)
+        if click_index < 6:
+            interruptible_sleep(random.uniform(1.0, 2.0))
+    interruptible_sleep(2.0)
+
+    for template_path, label in (
+        (TEMPLATE_BROWSE, "BROWSE"),
+        (TEMPLATE_CREATE, "create"),
+    ):
+        match = wait_for_template(hwnd, template_path, label, 60.0)
+        if match is None:
+            raise RecoveryRequested(f"60秒内未找到{label}")
+        click_match(match)
+        interruptible_sleep(2.0)
+
+    private_game = find_template_match(hwnd, TEMPLATE_PRIVATE_GAME)
+    if private_game is not None:
+        print(
+            f"[选图] 找到privitegame，置信度="
+            f"{private_game['confidence']:.3f}，点击一次"
+        )
+        click_match(private_game)
+    else:
+        print("[选图] 未找到privitegame，直接继续识别go_begin")
+
+    go_begin = wait_for_template(
+        hwnd,
+        TEMPLATE_GO_BEGIN,
+        "go_begin",
+        60.0,
+    )
+    if go_begin is None:
+        raise RecoveryRequested("60秒内未找到go_begin")
+    click_match(go_begin)
+    interruptible_sleep(2.0)
+
+    print("[进图] 已点击 go_begin，等待 core 出现")
+    core = wait_for_template(hwnd, TEMPLATE_CORE, "core", 240.0)
+    if core is None:
+        raise RecoveryRequested("240秒内未识别到core，地图未正常进入")
+    print("[进图] 已识别 core，正式进入西方世界")
+    return True
+
+
+def prepare_and_enter_wild_west(hwnd):
+    focus_game_window(hwnd)
+    walk_to_war_table_without_open(hwnd)
+    select_wild_west_map(hwnd)
+
+
+def wait_for_private_tavern_and_war_table(hwnd):
+    """After login, enter Private Tavern and wait until War Table is visible."""
+    focus_game_window(hwnd)
+    win_left, win_top, width, height = get_window_rect(hwnd)
+    center_x = win_left + width // 2
+    center_y = win_top + height // 2
+
+    print("[恢复] 等待并点击私人城镇")
+    tavern_clicked = False
+    for attempt in range(30):
+        if not find_game_window_or_none():
+            return False
+        try:
+            if war_table.detect_war_table(hwnd) is not None:
+                print("[恢复] 已经位于私人城堡并识别到 War Table")
+                return True
+        except Exception:
+            pass
+
+        war_table._click_at(center_x, center_y, delay=1.0)
+        tavern_pos = war_table._find_image_on_screen(
+            war_table.TEMPLATE_PRIVATE_TAVERN,
+            threshold=0.6,
+        )
+        if tavern_pos:
+            print(
+                f"[恢复] 找到私人城镇，位置="
+                f"({tavern_pos[0]}, {tavern_pos[1]})"
+            )
+            war_table._click_at(tavern_pos[0], tavern_pos[1], delay=0.5)
+            tavern_clicked = True
+            break
+        print(f"[恢复] 未找到私人城镇，重试 {attempt + 1}/30")
+        time.sleep(2.0)
+
+    if not tavern_clicked:
+        print("[恢复] 未点击到私人城镇，恢复本轮失败")
+        return False
+
+    print("[恢复] 等待私人城堡加载并识别 War Table")
+    for attempt in range(36):
+        if not find_game_window_or_none():
+            return False
+        try:
+            table = war_table.detect_war_table(hwnd)
+        except Exception as exc:
+            print(f"[恢复] War Table检测暂时失败: {exc}")
+            table = None
+        if table is not None:
+            print(
+                f"[恢复] 已进入私人城堡，War Table置信度={table[2]:.3f}"
+            )
+            return True
+        print(f"[恢复] 尚未识别到 War Table，重试 {attempt + 1}/36")
+        time.sleep(5.0)
+    return False
+
+
+def restart_game_to_private_tavern():
+    """Run the shared freeze restart flow and return in Private Tavern."""
+    stop_settlement_watch()
+    WINDOW_GUARD_ACTIVE.clear()
+    release_all_inputs()
+    print("[恢复] 执行卡死流程：关闭DD2并通过Steam重新启动")
+    war_table.close_dd2_game()
+    clear_recovery_request()
+    war_table.STOP_FLAG = False
+    hwnd = war_table._launch_game_via_steam_until_window("[West恢复]")
+    if not hwnd:
+        return None
+
+    WINDOW_GUARD_ACTIVE.set()
+    if not wait_for_private_tavern_and_war_table(hwnd):
+        return None
+    return hwnd
+
+
+def watchdog_loop():
+    """Monitor crashes, network failure, and 30 minutes without settlement."""
+    next_network_check = time.monotonic()
+    while not WATCHDOG_STOP.is_set() and not war_table.STOP_FLAG:
+        now = time.monotonic()
+
+        if WINDOW_GUARD_ACTIVE.is_set():
+            hwnd = find_game_window_or_none()
+            if not hwnd:
+                request_recovery("DD2游戏窗口消失或游戏闪退")
+            elif now >= next_network_check:
+                next_network_check = now + NETWORK_CHECK_INTERVAL_SECONDS
+                try:
+                    match = find_template_match(
+                        hwnd,
+                        TEMPLATE_CONNECTION_FAILED,
+                        threshold=CONNECTION_FAILED_THRESHOLD,
+                    )
+                    if match is not None:
+                        request_recovery(
+                            "检测到网络连接中断 connectionfailed.png"
+                        )
+                except Exception as exc:
+                    print(f"[网络检测] 本次截图失败，60秒后重试: {exc}")
+        else:
+            next_network_check = now
+
+        if SETTLEMENT_WATCH_ACTIVE.is_set():
+            idle_seconds = seconds_since_last_settlement(now)
+            if idle_seconds >= NO_SETTLEMENT_TIMEOUT_SECONDS:
+                request_recovery(
+                    f"连续 {idle_seconds / 60:.1f} 分钟未识别到结算画面"
+                )
+
+        WATCHDOG_STOP.wait(0.5)
+
+
+def start_watchdog():
+    thread = threading.Thread(
+        target=watchdog_loop,
+        name="west-build-watchdog",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def click_replay_button(hwnd):
+    client_rect = win32gui.GetClientRect(hwnd)
+    client_width, client_height = client_rect[2], client_rect[3]
+    rel_x = (0.6 + 0.68) / 2
+    rel_y = (0.88 + 0.91) / 2
+    client_x = int(rel_x * client_width)
+    client_y = int(rel_y * client_height)
+    screen_x, screen_y = win32gui.ClientToScreen(
+        hwnd,
+        (client_x, client_y),
+    )
+    humanized_move_to(screen_x, screen_y)
+    time.sleep(random.uniform(0.8, 1.2))
+    pyautogui.click()
+
+
+def wait_for_core_after_replay(hwnd):
+    interruptible_sleep(5.0)
+    core = wait_for_template(hwnd, TEMPLATE_CORE, "core", 240.0)
+    if core is None:
+        raise RecoveryRequested("Replay后240秒内未识别到core")
+    print("[循环] Replay后已识别core，开始下一轮")
+
+
+def run_current_round(hwnd):
+    print("🚀 开始执行建造流程...")
+    build_western_festival()
+    raise_if_recovery_requested()
+    print("[卖装备] 已按 F4 切换人物，等待2秒后开始卖装备")
+    interruptible_sleep(2.0)
+    war_table.sell_equipment()
+    raise_if_recovery_requested()
+    print("[战斗] 卖装备完成，按 0 正式开始")
+    interruptible_sleep(1.0)
+    humanized_press("0")
+    interruptible_sleep(1.0)
+
+
+def run_gameplay_loop(hwnd, stats):
+    start_settlement_watch()
+    run_current_round(hwnd)
+    print("🔄 进入结算/replay循环监测...")
+
+    while True:
+        raise_if_recovery_requested()
+        if not find_game_window_or_none():
+            raise RecoveryRequested("地图循环中DD2游戏窗口消失")
+        interruptible_sleep(3.0)
+
+        extra_reward = locate_image(
+            hwnd,
+            TEMPLATE_EXTRA_REWARD,
+            '额外奖励区域',
+            confidence=0.8,
+        )
+        if extra_reward:
+            mark_settlement_seen("额外奖励")
+            print("🎁 额外奖励")
+            interruptible_sleep(3.0)
+            humanized_press("ENTER")
+            interruptible_sleep(3.0)
+
+        replay = locate_image(
+            hwnd,
+            TEMPLATE_REPLAY,
+            'replay区域',
+            confidence=0.8,
+        )
+        if replay:
+            mark_settlement_seen("replay")
+            print(f"🔄 replay，第{stats['round']}轮完成")
+            interruptible_sleep(3.0)
+            click_replay_button(hwnd)
+            wait_for_core_after_replay(hwnd)
+            run_current_round(hwnd)
+            stats["round"] += 1
+        else:
+            interruptible_sleep(1.0)
+            failure = locate_image(
+                hwnd,
+                TEMPLATE_FAILURE_RETRY,
+                '失败重来区域',
+                confidence=0.8,
+            )
+            if failure:
+                mark_settlement_seen("失败重来")
+                print("💀 失败，重来")
+                interruptible_sleep(2.0)
+                humanized_press("N")
+                interruptible_sleep(3.0)
+
+                print("🔍 等待replay界面...")
+                replay_found = False
+                for _ in range(20):
+                    raise_if_recovery_requested()
+                    replay = locate_image(
+                        hwnd,
+                        TEMPLATE_REPLAY,
+                        'replay区域',
+                        confidence=0.8,
+                    )
+                    if replay:
+                        mark_settlement_seen("失败后的replay")
+                        print("✅ 找到replay按钮")
+                        click_replay_button(hwnd)
+                        replay_found = True
+                        break
+                    interruptible_sleep(3.0)
+                if not replay_found:
+                    raise RecoveryRequested("失败后60秒内未找到replay按钮")
+
+                wait_for_core_after_replay(hwnd)
+                run_current_round(hwnd)
+                stats["round"] += 1
+                stats["failures"] += 1
+
+        humanized_press("0")
+        print(
+            f"第 {stats['round']} 轮, "
+            f"失败: {stats['failures']}"
+        )
 
 
 def main():
-    print("=" * 60)
-    print("  DD2 挂机脚本 - 完整版")
-    print("=" * 60)
-    print("")
+    print("=" * 66)
+    print("  DD2 西方世界建造脚本 - 自动启动、进图与卡死恢复版")
+    print("=" * 66)
+    print("- 有游戏窗口：直接寻找 War Table")
+    print("- 无游戏窗口：执行 Steam 卡死恢复并进入私人城堡")
+    print("- 每轮建造宏结束并按 F4 后，执行无限爬塔卖装备流程")
+    print("- 网络中断：每60秒识别 connectionfailed.png")
+    print("- 30分钟未识别结算画面：自动重启")
+    print("- F12：立即停止脚本")
 
-    hwnd = win32gui.FindWindow(GAME_CLASS, GAME_TITLE)
-    if hwnd == 0:
-        print("❌ 找不到游戏窗口")
+    required_templates = (
+        war_table.CONFIG["backpack1_template"],
+        war_table.CONFIG["backpack2_template"],
+        war_table.CONFIG["level10_equipment_template"],
+        TEMPLATE_EXTRA_REWARD,
+        TEMPLATE_REPLAY,
+        TEMPLATE_FAILURE_RETRY,
+        TEMPLATE_WILD_WEST,
+        TEMPLATE_WILD_WEST_STAGE,
+        TEMPLATE_CHAOS1_BEGIN,
+        TEMPLATE_BROWSE,
+        TEMPLATE_CREATE,
+        TEMPLATE_PRIVATE_GAME,
+        TEMPLATE_GO_BEGIN,
+        TEMPLATE_CORE,
+        TEMPLATE_CONNECTION_FAILED,
+    )
+    missing_templates = [
+        path for path in required_templates if not os.path.exists(path)
+    ]
+    if missing_templates:
+        print("[ERROR] 以下模板文件不存在：")
+        for path in missing_templates:
+            print(f"  {path}")
         return
 
-    print(f"✅ 找到游戏窗口: {hwnd}")
-    l, t, w, h = get_window_rect(hwnd)
-    cw, ch = get_client_rect(hwnd)
-    print(f"窗口位置: ({l}, {t}), 尺寸: {w}x{h}")
-    print(f"客户区尺寸: {cw}x{ch}")
-    print("")
+    war_table.STOP_FLAG = False
+    war_table.register_stop_hotkey()
+    war_table.enable_system_keep_awake()
+    start_watchdog()
 
-    print("🔄 自动切换到游戏窗口...")
-    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-    win32gui.SetForegroundWindow(hwnd)
-    time.sleep(0.5)
-
-    print("倒计时 5 秒，请确保游戏窗口在前台...")
-    print("")
-    for i in range(5, 0, -1):
-        print(f"   {i}...")
-        time.sleep(1)
-
-    print("")
-    print("🚀 开始执行建造流程...")
-
-    build_western_festival()
-    time.sleep(1.0)
-    sell_equipment(hwnd)
-    time.sleep(1.0)
-    humanized_press("0")
-    time.sleep(1.0)
-
-    print("")
-    print("🔄 进入循环监测...")
-    k = 1
-    m = 0
+    stats = {"round": 1, "failures": 0}
+    recovery_required = find_game_window_or_none() is None
+    if recovery_required:
+        print("[启动] 未检测到DD2窗口，按一次卡死流程处理")
+    else:
+        print("[启动] 已检测到DD2窗口，直接进入War Table流程")
 
     try:
-        while True:
-            time.sleep(3.0)
+        while not war_table.STOP_FLAG:
+            stop_settlement_watch()
 
-            xy = locate_image(hwnd, r"D:\DD2脚本\额外奖励.png", '额外奖励区域', confidence=0.8)
-            if xy:
-                print("🎁 额外奖励")
-                time.sleep(3.0)
-                humanized_press("ENTER")
-                time.sleep(3.0)
+            try:
+                if recovery_required:
+                    hwnd = restart_game_to_private_tavern()
+                    if not hwnd:
+                        print("[恢复] 本次恢复失败，10秒后继续重试")
+                        time.sleep(10.0)
+                        continue
+                    recovery_required = False
+                else:
+                    clear_recovery_request()
+                    hwnd = find_game_window_or_none()
+                    if not hwnd:
+                        raise RecoveryRequested(
+                            "启动或循环阶段未检测到DD2游戏窗口"
+                        )
+                    WINDOW_GUARD_ACTIVE.set()
+                    focus_game_window(hwnd)
 
-            xy = locate_image(hwnd, r"D:\DD2脚本\replay.png", 'replay区域', confidence=0.8)
-            if xy:
-                print("🔄 replay")
-                print(f"第{k}轮完成")
-                time.sleep(3.0)
-                
-                client_rect = win32gui.GetClientRect(hwnd)
-                cw, ch = client_rect[2], client_rect[3]
-                rel_x = (0.6 + 0.68) / 2
-                rel_y = (0.88 + 0.91) / 2
-                client_x = int(rel_x * cw)
-                client_y = int(rel_y * ch)
-                screen_x, screen_y = win32gui.ClientToScreen(hwnd, (client_x, client_y))
-                
-                humanized_move_to(screen_x, screen_y)
-                time.sleep(random.uniform(0.8, 1.2))
-                pyautogui.click()
-                humanized_sleep(50.0)
+                l, t, w, h = get_window_rect(hwnd)
+                print(
+                    f"[启动] 游戏窗口句柄={hwnd}，"
+                    f"位置=({l}, {t})，尺寸={w}x{h}"
+                )
+                prepare_and_enter_wild_west(hwnd)
+                run_gameplay_loop(hwnd, stats)
 
-                print("🚀 重新开始")
-                build_western_festival()
-                time.sleep(1.0)
-                sell_equipment(hwnd)
-                time.sleep(2.0)
-                humanized_press("0")
-                k += 1
-            else:
-                time.sleep(1.0)
-
-                xy = locate_image(hwnd, r"D:\DD2脚本\失败重来.png", '失败重来区域', confidence=0.8)
-                if xy:
-                    print("💀 失败，重来")
-                    time.sleep(2.0)
-                    humanized_press("N")
-                    time.sleep(3.0)
-
-                    print("🔍 等待replay界面...")
-                    for _ in range(20):
-                        xy_replay = locate_image(hwnd, r"D:\DD2脚本\replay.png", 'replay区域', confidence=0.8)
-                        if xy_replay:
-                            print("✅ 找到replay按钮")
-                            
-                            client_rect = win32gui.GetClientRect(hwnd)
-                            cw, ch = client_rect[2], client_rect[3]
-                            
-                            rel_x = (0.6 + 0.68) / 2
-                            rel_y = (0.88 + 0.91) / 2
-                            client_x = int(rel_x * cw)
-                            client_y = int(rel_y * ch)
-                            
-                            screen_x, screen_y = win32gui.ClientToScreen(hwnd, (client_x, client_y))
-                            
-                            humanized_move_to(screen_x, screen_y)
-                            time.sleep(random.uniform(0.8, 1.2))
-                            pyautogui.click()
-                            humanized_sleep(50.0)
-                            break
-                        time.sleep(3.0)
-                    else:
-                        print("⚠️ 未找到replay按钮，继续")
-
-                    print("🚀 重新开始")
-                    build_western_festival()
-                    time.sleep(2.0)
-                    sell_equipment(hwnd)
-                    humanized_press("0")
-                    k += 1
-                    m += 1
-
-            humanized_press("0")
-            print(f"第 {k} 轮, 失败: {m}")
+            except RecoveryRequested as exc:
+                stop_settlement_watch()
+                WINDOW_GUARD_ACTIVE.clear()
+                release_all_inputs()
+                print(f"[卡死检测] 主流程中断：{exc}")
+                recovery_required = True
+            except Exception as exc:
+                stop_settlement_watch()
+                WINDOW_GUARD_ACTIVE.clear()
+                release_all_inputs()
+                print(f"[ERROR] 主流程异常，转入卡死恢复：{exc}")
+                recovery_required = True
 
     except KeyboardInterrupt:
-        print("")
-        print("👋 退出")
+        print("\n[INFO] 收到 Ctrl+C，脚本停止")
+    finally:
+        WATCHDOG_STOP.set()
+        stop_settlement_watch()
+        WINDOW_GUARD_ACTIVE.clear()
+        release_all_inputs()
+        war_table.disable_system_keep_awake()
 
 
 if __name__ == "__main__":

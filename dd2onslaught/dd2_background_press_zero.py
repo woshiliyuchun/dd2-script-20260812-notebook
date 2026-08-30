@@ -8,9 +8,10 @@ from ctypes import wintypes
 GAME_WINDOW_CLASS = "LaunchUnrealUWindowsClient"
 GAME_WINDOW_TITLE = "Dungeon Defenders 2"
 ZERO_INTERVAL_SECONDS = 3.0
-THREE_INTERVAL_SECONDS = 6.0
+THREE_INTERVAL_SECONDS = 10.0
 THREE_TO_CLICK_DELAY_SECONDS = 2.0
 KEY_HOLD_SECONDS = 0.05
+KEY_SEQUENCE_GAP_SECONDS = 0.1
 HOTKEY_POLL_SECONDS = 0.05
 
 WM_KEYDOWN = 0x0100
@@ -21,6 +22,7 @@ WM_LBUTTONUP = 0x0202
 MK_LBUTTON = 0x0001
 VK_0 = 0x30
 VK_3 = 0x33
+VK_Y = 0x59
 VK_F12 = 0x7B
 MAPVK_VK_TO_VSC = 0
 
@@ -112,6 +114,14 @@ def send_key_to_window(hwnd, virtual_key):
     return True
 
 
+def send_y_then_zero(hwnd):
+    """Post Y, then post 0 after both Y key messages have completed."""
+    if not send_key_to_window(hwnd, VK_Y):
+        return False
+    time.sleep(KEY_SEQUENCE_GAP_SECONDS)
+    return send_key_to_window(hwnd, VK_0)
+
+
 def send_left_click_to_window(hwnd):
     """Post one left click at the center of the target window's client area."""
     if not hwnd or not user32.IsWindow(hwnd):
@@ -146,8 +156,8 @@ def is_f12_down():
 
 
 def main():
-    print("[后台按键] 每3秒向DD2发送一次主键盘数字0")
-    print("[后台按键] 每6秒发送一次数字3，并在每次数字3后2秒发送一次左键")
+    print("[后台按键] 每3秒先向DD2发送Y，再发送主键盘数字0")
+    print("[后台按键] 每10秒发送一次数字3，并在每次数字3后2秒发送一次左键")
     print("[后台按键] 按 F12 停止脚本")
 
     current_hwnd = None
@@ -200,10 +210,10 @@ def main():
 
             send_failed = False
             if action == "zero":
-                if send_key_to_window(current_hwnd, VK_0):
+                if send_y_then_zero(current_hwnd):
                     zero_count += 1
                     if zero_count == 1 or zero_count % 20 == 0:
-                        print(f"[后台按键] 已发送 {zero_count} 次数字0")
+                        print(f"[后台按键] 已发送 {zero_count} 次Y和数字0")
                 else:
                     send_failed = True
 
