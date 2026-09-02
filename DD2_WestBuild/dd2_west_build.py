@@ -50,6 +50,7 @@ TEMPLATE_CORE = str(WEST_BUILD_DIR / "picture" / "core.png")
 TEMPLATE_CONNECTION_FAILED = str(PROJECT_DIR / "DD2ganmedie" / "connectionfailed.png")
 TEMPLATE_CACHE = {}
 MAP_MATCH_THRESHOLD = 0.7
+CHAOS1_DIFFICULTY_CLICK_COUNT = 7  # 点击次数越多，难度越高
 CONNECTION_FAILED_THRESHOLD = 0.9
 NETWORK_CHECK_INTERVAL_SECONDS = 60.0
 NO_SETTLEMENT_TIMEOUT_SECONDS = 30.0 * 60.0
@@ -1136,10 +1137,13 @@ def select_wild_west_map(hwnd):
     if chaos1 is None:
         raise RecoveryRequested("60秒内未在游戏右半侧找到chaos1_begin")
     chaos1["screen_x"] += int(chaos1["frame_width"] * 0.065)
-    print("[选图] 点击 chaos1_begin 右侧游戏宽度6.5%的位置，共7次，每次间隔1-2秒")
-    for click_index in range(7):
+    print(
+        f"[选图] 点击 chaos1_begin 右侧游戏宽度6.5%的位置，"
+        f"共{CHAOS1_DIFFICULTY_CLICK_COUNT}次，每次间隔1-2秒"
+    )
+    for click_index in range(CHAOS1_DIFFICULTY_CLICK_COUNT):
         click_match(chaos1)
-        if click_index < 6:
+        if click_index < CHAOS1_DIFFICULTY_CLICK_COUNT - 1:
             interruptible_sleep(random.uniform(1.0, 2.0))
     interruptible_sleep(2.0)
 
