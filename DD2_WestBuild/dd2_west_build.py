@@ -29,7 +29,7 @@ COORD_CONFIG = {
 }
 
 REGION_CONFIG = {
-    '额外奖励区域': (0.35, 0.3, 0.8, 1.2),
+    '全屏区域': (0.0, 0.0, 1.0, 1.0),
     'replay区域': (0.6, 0.88, 0.68, 0.91),
     '失败重来区域': (0.48, 0.77, 0.5, 0.8),
 }
@@ -50,7 +50,7 @@ TEMPLATE_CORE = str(WEST_BUILD_DIR / "picture" / "core.png")
 TEMPLATE_CONNECTION_FAILED = str(PROJECT_DIR / "DD2ganmedie" / "connectionfailed.png")
 TEMPLATE_CACHE = {}
 MAP_MATCH_THRESHOLD = 0.7
-CHAOS1_DIFFICULTY_CLICK_COUNT = 7  # 点击次数越多，难度越高
+CHAOS1_DIFFICULTY_CLICK_COUNT = 6  # 点击次数越多，难度越高
 CONNECTION_FAILED_THRESHOLD = 0.9
 NETWORK_CHECK_INTERVAL_SECONDS = 60.0
 NO_SETTLEMENT_TIMEOUT_SECONDS = 30.0 * 60.0
@@ -387,7 +387,7 @@ def build_western_festival():
     pyautogui.click()
     time.sleep(500 / 1000.0)
     key_down("F2"); time.sleep(50 / 1000.0); key_up("F2")
-    time.sleep(1140 / 1000.0)
+    time.sleep(1240 / 1000.0)
     key_down("7"); time.sleep(112 / 1000.0); key_up("7")
     time.sleep(520 / 1000.0)
     key_down("D"); time.sleep(28 / 1000.0)
@@ -479,7 +479,7 @@ def build_western_festival():
     pyautogui.click()
 
     time.sleep(292 / 1000.0)
-    key_down("S"); time.sleep(256 / 1000.0)
+    key_down("S"); time.sleep(556 / 1000.0)
     key_down("D"); time.sleep(507 / 1000.0)
     time.sleep(28 / 1000.0)
     key_down("D"); time.sleep(34 / 1000.0)
@@ -578,7 +578,8 @@ def build_western_festival():
     pyautogui.click()
     time.sleep(400 / 1000.0)
     key_down("F4"); time.sleep(50 / 1000.0); key_up("F4")
-    time.sleep(1100 / 1000.0)
+    time.sleep(3000 / 1000.0)
+    time.sleep(2830 / 1000.0)
     key_down("5"); time.sleep(89 / 1000.0); key_up("5")
 
     time.sleep(744 / 1000.0)
@@ -600,6 +601,7 @@ def build_western_festival():
     time.sleep(451 / 1000.0)
     key_down("F1"); time.sleep(140 / 1000.0); key_up("F1")
     time.sleep(687 / 1000.0)
+    time.sleep(2830 / 1000.0)
     key_down("6"); time.sleep(77 / 1000.0); key_up("6")
     time.sleep(361 / 1000.0)
     key_down("D"); time.sleep(131 / 1000.0)
@@ -640,7 +642,8 @@ def build_western_festival():
     key_down("CTRL"); time.sleep(326 / 1000.0)
     key_down("P"); time.sleep(75 / 1000.0)
     key_up("P"); time.sleep(105 / 1000.0)
-    key_up("CTRL"); time.sleep(7993 / 1000.0)
+    key_up("CTRL"); time.sleep(9993 / 1000.0)
+    time.sleep(556 / 1000.0)
     key_down("W"); time.sleep(423 / 1000.0); key_up("W")
     time.sleep(306 / 1000.0)
     key_down("Space"); time.sleep(90 / 1000.0); key_up("Space")
@@ -682,7 +685,8 @@ def build_western_festival():
     key_down("A"); time.sleep(160 / 1000.0); key_up("A")
     time.sleep(1000 / 1000.0)
     key_down("F2"); time.sleep(132 / 1000.0); key_up("F2")
-    time.sleep(1111 / 1000.0)
+    time.sleep(2011 / 1000.0)
+    time.sleep(2830 / 1000.0)
     key_down("7"); time.sleep(506 / 1000.0); key_up("7")
     time.sleep(506 / 1000.0)
     key_down("A"); time.sleep(508 / 1000.0)
@@ -701,7 +705,7 @@ def build_western_festival():
     pyautogui.click()
     time.sleep(1100 / 1000.0)
     key_down("F4"); time.sleep(50 / 1000.0); key_up("F4")
-    time.sleep(1200 / 1000.0)
+    time.sleep(2200 / 1000.0)
     key_down("5"); time.sleep(50 / 1000.0); key_up("5")
 
     time.sleep(90 / 1000.0)
@@ -726,6 +730,7 @@ def build_western_festival():
     time.sleep(33 / 1000.0)
     key_down("W"); time.sleep(30 / 1000.0)
     time.sleep(26 / 1000.0)
+    pyautogui.click()
     key_down("W"); time.sleep(34 / 1000.0)
     time.sleep(29 / 1000.0)
     key_down("W"); time.sleep(28 / 1000.0)
@@ -770,6 +775,7 @@ def build_western_festival():
     key_up("W"); time.sleep(479 / 1000.0)
     key_down("A"); time.sleep(28 / 1000.0)
     time.sleep(34 / 1000.0)
+    pyautogui.click()
     key_down("A"); time.sleep(29 / 1000.0)
     time.sleep(27 / 1000.0)
     key_down("A"); time.sleep(35 / 1000.0)
@@ -833,7 +839,7 @@ def build_western_festival():
     pyautogui.click()
     time.sleep(500 / 1000.0)
     key_down("F2"); time.sleep(50 / 1000.0); key_up("F2")
-    time.sleep(1182 / 1000.0)
+    time.sleep(1582 / 1000.0)
     key_down("7"); time.sleep(50 / 1000.0); key_up("7")
     time.sleep(361 / 1000.0)
     key_down("D"); time.sleep(195 / 1000.0); key_up("D")
@@ -928,7 +934,7 @@ def build_western_festival():
     pyautogui.mouseUp(); time.sleep(2 / 1000.0)
     key_up("D"); time.sleep(2830 / 1000.0)
     key_down("F4"); time.sleep(152 / 1000.0); key_up("F4")
-
+    time.sleep(2830 / 1000.0)
     print("✅ 建造西方节日完成")
 
 
@@ -1368,7 +1374,7 @@ def run_gameplay_loop(hwnd, stats):
         extra_reward = locate_image(
             hwnd,
             TEMPLATE_EXTRA_REWARD,
-            '额外奖励区域',
+            '全屏区域',
             confidence=0.8,
         )
         if extra_reward:
