@@ -89,7 +89,7 @@ if os.path.exists(TESSERACT_EXE):
 # ========================= 全局配置（只改这里） =========================
 CONFIG = {
     "game_class": "LaunchUnrealUWindowsClient",
-    "game_title": "Dungeon Defenders 2",
+    "game_title": "Dungeon Defenders 2 [DX11]",
 
     # 识别模板路径（后续补图以后只改这里即可）
     # 这里默认使用脚本所在目录下的 picture 文件夹，避免硬编码到某一台电脑的绝对路径。

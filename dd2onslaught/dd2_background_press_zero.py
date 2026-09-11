@@ -6,7 +6,7 @@ from ctypes import wintypes
 
 
 GAME_WINDOW_CLASS = "LaunchUnrealUWindowsClient"
-GAME_WINDOW_TITLE = "Dungeon Defenders 2"
+GAME_WINDOW_TITLE = "Dungeon Defenders 2 [DX11]"
 ZERO_INTERVAL_SECONDS = 3.0
 THREE_INTERVAL_SECONDS = 10.0
 THREE_TO_CLICK_DELAY_SECONDS = 2.0

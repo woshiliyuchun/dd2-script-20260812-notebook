@@ -13,7 +13,7 @@ import subprocess
 
 # ========dw============ 配置 ====================
 GAME_CLASS = "LaunchUnrealUWindowsClient"
-GAME_TITLE = "Dungeon Defenders 2"
+GAME_TITLE = "Dungeon Defenders 2 [DX11]"
 GAME_PROCESS_NAME = "DD2"
 
 SCRIPT_DIR = r"D:\DD2脚本\DD2ganmedie"

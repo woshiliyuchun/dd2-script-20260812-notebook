@@ -19,7 +19,7 @@ if str(PROJECT_DIR) not in sys.path:
 from dd2onslaught import dd2_war_table_walk as war_table
 
 GAME_CLASS = "LaunchUnrealUWindowsClient"
-GAME_TITLE = "Dungeon Defenders 2"
+GAME_TITLE = "Dungeon Defenders 2 [DX11]"
 
 SCREEN_WIDTH = 1920
 SCREEN_HEIGHT = 1080
@@ -50,7 +50,7 @@ TEMPLATE_CORE = str(WEST_BUILD_DIR / "picture" / "core.png")
 TEMPLATE_CONNECTION_FAILED = str(PROJECT_DIR / "DD2ganmedie" / "connectionfailed.png")
 TEMPLATE_CACHE = {}
 MAP_MATCH_THRESHOLD = 0.7
-CHAOS1_DIFFICULTY_CLICK_COUNT = 6  # 点击次数越多，难度越高
+CHAOS1_DIFFICULTY_CLICK_COUNT = 7  # 点击次数越多，难度越高
 CONNECTION_FAILED_THRESHOLD = 0.9
 NETWORK_CHECK_INTERVAL_SECONDS = 60.0
 NO_SETTLEMENT_TIMEOUT_SECONDS = 30.0 * 60.0
